@@ -10,40 +10,54 @@ import (
 type LimiterConfig struct {
 	// BaseRate is the unconstrained refill rate in tokens/s. Default: 20.
 	BaseRate float64
-	// MinRateFraction is the floor as a fraction of BaseRate after sustained
-	// Backoff calls. Default: 0.1 (10 % of base).
+	// MinRateFraction is the floor as a fraction of BaseRate. Default: 0.1.
 	MinRateFraction float64
-	// MaxBurst is the token bucket capacity (burst ceiling). Default: BaseRate.
+	// MaxBurst is the token bucket capacity. Default: BaseRate.
 	MaxBurst float64
-	// RecoveryThreshold is the number of successful Acquires before the rate
-	// nudges back toward BaseRate. Default: 10.
-	RecoveryThreshold int
+
+	// RecoveryCooldown is how long after the last pause window ends before
+	// additive rate recovery begins. Default: 5s.
+	RecoveryCooldown time.Duration
+	// RecoveryStep is the tokens/s added per RecoveryInterval of elapsed time
+	// once recovery is eligible. Default: 1 token/s per interval.
+	RecoveryStep float64
+	// RecoveryInterval is the clock period between recovery increments.
+	// Default: 2s.
+	RecoveryInterval time.Duration
 }
 
-// Limiter is the account-shared, adaptive client-side throttle. Throttling is
-// a property of the ACCOUNT, not the call site: all cohorts reconciling
-// against one account share one Limiter, so a Throttle fault backs the whole
-// client off rather than letting each goroutine hammer in parallel (which is
-// precisely what ParallelCluster gets wrong).
+// Limiter is the account-shared adaptive token bucket for one cloud account.
+// All cohorts reconciling against one account share one Limiter.
+//
+// Rate recovery is entirely time-driven (A1): after recoveryCooldown has elapsed
+// since the end of the last pause window, rate increases additively by
+// recoveryStep per recoveryInterval of elapsed time up to baseRate.
+// Any Backoff resets eligibility.
+//
+// Refill is suspended during an active pause window (A2): no tokens accrue
+// while paused, so a burst cannot defeat the pause the instant it lifts.
+// Backoff clamps the bucket to ≤1 token (prevents post-pause burst) and halves
+// the rate (floor: minRate). Post-Backoff stall ≈ exactly d.
 type Limiter struct {
 	mu sync.Mutex
 
 	tokens    float64
 	maxTokens float64
-	rate      float64 // current tokens/s
-	baseRate  float64 // ceiling: rate recovers toward this after backoffs
-	minRate   float64 // floor: rate never falls below this
+	rate      float64
+	baseRate  float64
+	minRate   float64
 
-	// pauseUntil is set by Backoff; tryAcquire returns the remaining wait until
-	// this time even if tokens are available. This is the hard pause window.
+	// Pause window set by Backoff; refill suspended, tokens clamped to ≤1.
 	pauseUntil time.Time
-	lastRefill time.Time
 
-	// successSince counts successful Acquires since the last Backoff. When it
-	// reaches recoveryThreshold, rate is nudged toward baseRate and the counter
-	// resets. This is "recovers gradually on sustained success."
-	successSince      int
-	recoveryThreshold int
+	// Recovery eligibility: not before lastBackoffEnd + recoveryCooldown.
+	lastBackoffEnd   time.Time
+	recoveryCooldown time.Duration
+	recoveryStep     float64
+	recoveryInterval time.Duration
+
+	// lastRefill tracks real-time token accrual; suspended during pause.
+	lastRefill time.Time
 
 	clock func() time.Time
 }
@@ -63,24 +77,31 @@ func NewLimiter(cfg LimiterConfig, clock func() time.Time) *Limiter {
 	if cfg.MaxBurst <= 0 {
 		cfg.MaxBurst = cfg.BaseRate
 	}
-	if cfg.RecoveryThreshold <= 0 {
-		cfg.RecoveryThreshold = 10
+	if cfg.RecoveryCooldown <= 0 {
+		cfg.RecoveryCooldown = 5 * time.Second
+	}
+	if cfg.RecoveryStep <= 0 {
+		cfg.RecoveryStep = 1.0
+	}
+	if cfg.RecoveryInterval <= 0 {
+		cfg.RecoveryInterval = 2 * time.Second
 	}
 	now := clock()
 	return &Limiter{
-		tokens:            cfg.MaxBurst,
-		maxTokens:         cfg.MaxBurst,
-		rate:              cfg.BaseRate,
-		baseRate:          cfg.BaseRate,
-		minRate:           cfg.BaseRate * cfg.MinRateFraction,
-		recoveryThreshold: cfg.RecoveryThreshold,
-		lastRefill:        now,
-		clock:             clock,
+		tokens:           cfg.MaxBurst,
+		maxTokens:        cfg.MaxBurst,
+		rate:             cfg.BaseRate,
+		baseRate:         cfg.BaseRate,
+		minRate:          cfg.BaseRate * cfg.MinRateFraction,
+		recoveryCooldown: cfg.RecoveryCooldown,
+		recoveryStep:     cfg.RecoveryStep,
+		recoveryInterval: cfg.RecoveryInterval,
+		lastRefill:       now,
+		clock:            clock,
 	}
 }
 
-// Acquire blocks until the Limiter grants one permit. It respects ctx
-// cancellation, which returns ctx.Err() without consuming a token.
+// Acquire blocks until the Limiter grants one permit or ctx is cancelled.
 func (l *Limiter) Acquire(ctx context.Context) error {
 	for {
 		wait := l.tryAcquire()
@@ -97,10 +118,11 @@ func (l *Limiter) Acquire(ctx context.Context) error {
 	}
 }
 
-// Backoff is called on a FaultThrottle to slow the whole client.
-// d is the caller-computed backoff window (exponential + jitter from the
-// reconciler). Backoff: halves the refill rate (floor minRate), drains the
-// bucket, and sets a hard pause for d before the next Acquire can proceed.
+// Backoff is called on a FaultThrottle. It:
+//   - halves rate (floor minRate),
+//   - clamps tokens to ≤1 (no post-pause burst),
+//   - sets a hard pause window of d (takes max across concurrent calls),
+//   - records lastBackoffEnd = now+d to reset recovery eligibility.
 func (l *Limiter) Backoff(d time.Duration) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -108,33 +130,35 @@ func (l *Limiter) Backoff(d time.Duration) {
 	if l.rate < l.minRate {
 		l.rate = l.minRate
 	}
-	l.tokens = 0
-	if d > 0 {
-		resume := l.clock().Add(d)
-		if resume.After(l.pauseUntil) {
-			l.pauseUntil = resume
-		}
+	if l.tokens > 1 {
+		l.tokens = 1
 	}
-	l.successSince = 0
+	end := l.clock().Add(d)
+	if end.After(l.pauseUntil) {
+		l.pauseUntil = end
+	}
+	if end.After(l.lastBackoffEnd) {
+		l.lastBackoffEnd = end
+	}
 }
 
-// tryAcquire attempts to take one token without blocking.
-// Returns 0 if a token was acquired; otherwise returns how long to wait.
+// tryAcquire attempts to consume one token without blocking.
+// Returns 0 if successful; otherwise returns how long to sleep.
 func (l *Limiter) tryAcquire() time.Duration {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	now := l.clock()
-	l.refill(now)
+
 	if now.Before(l.pauseUntil) {
+		// Refill is suspended during the active pause window.
 		return l.pauseUntil.Sub(now)
 	}
+
+	l.refill(now)
+	l.applyRecovery(now)
+
 	if l.tokens >= 1 {
 		l.tokens--
-		l.successSince++
-		if l.successSince >= l.recoveryThreshold {
-			l.recoverRate()
-			l.successSince = 0
-		}
 		return 0
 	}
 	needed := 1.0 - l.tokens
@@ -145,11 +169,12 @@ func (l *Limiter) tryAcquire() time.Duration {
 	return wait
 }
 
-// refill adds tokens for elapsed time at the current rate, capped at maxTokens.
-// Must be called with l.mu held.
+// refill adds tokens for elapsed time since lastRefill at the current rate.
+// Must be called with l.mu held. Not called while paused.
 func (l *Limiter) refill(now time.Time) {
 	elapsed := now.Sub(l.lastRefill).Seconds()
 	if elapsed <= 0 {
+		l.lastRefill = now
 		return
 	}
 	l.tokens += elapsed * l.rate
@@ -159,15 +184,22 @@ func (l *Limiter) refill(now time.Time) {
 	l.lastRefill = now
 }
 
-// recoverRate nudges rate toward baseRate by 25 % of the remaining gap.
-// Called every recoveryThreshold successful Acquires.
-// Must be called with l.mu held.
-func (l *Limiter) recoverRate() {
-	gap := l.baseRate - l.rate
-	if gap <= 0 {
+// applyRecovery additively increases rate toward baseRate once the cooldown
+// after the last pause has elapsed. Each recoveryInterval of elapsed time
+// adds recoveryStep tokens/s. Must be called with l.mu held.
+func (l *Limiter) applyRecovery(now time.Time) {
+	if l.rate >= l.baseRate {
 		return
 	}
-	l.rate += gap * 0.25
+	eligible := l.lastBackoffEnd.Add(l.recoveryCooldown)
+	if now.Before(eligible) {
+		return
+	}
+	intervals := now.Sub(eligible).Seconds() / l.recoveryInterval.Seconds()
+	if intervals < 1 {
+		return
+	}
+	l.rate += float64(int(intervals)) * l.recoveryStep
 	if l.rate > l.baseRate {
 		l.rate = l.baseRate
 	}

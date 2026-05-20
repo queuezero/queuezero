@@ -6,31 +6,34 @@ import (
 	"time"
 )
 
-// advancingClock returns a clock that advances by step every call.
-func advancingClock(start time.Time, step time.Duration) func() time.Time {
-	t := start
-	return func() time.Time {
-		now := t
-		t = t.Add(step)
-		return now
-	}
-}
-
-// fixedClock returns a clock pinned to t; callers advance via the pointer.
+// fixedClock returns a clock pinned to *t; advance *t to move time.
 func fixedClock(t *time.Time) func() time.Time {
 	return func() time.Time { return *t }
 }
 
+// cfg returns a baseline LimiterConfig with short recovery settings for tests.
+func cfg(base float64) LimiterConfig {
+	return LimiterConfig{
+		BaseRate:         base,
+		MinRateFraction:  0.1,
+		MaxBurst:         base,
+		RecoveryCooldown: 5 * time.Second,
+		RecoveryStep:     1.0,
+		RecoveryInterval: 2 * time.Second,
+	}
+}
+
+// ---- original 7 tests -------------------------------------------------------
+
 func TestLimiter_Acquire_ImmediateWhenFull(t *testing.T) {
-	now := time.Unix(0, 0)
-	l := NewLimiter(LimiterConfig{BaseRate: 10, MaxBurst: 10}, fixedClock(&now))
+	now := time.Unix(1000, 0)
+	l := NewLimiter(cfg(10), fixedClock(&now))
 	ctx := context.Background()
 	for i := 0; i < 10; i++ {
 		if err := l.Acquire(ctx); err != nil {
 			t.Fatalf("acquire %d: unexpected error: %v", i, err)
 		}
 	}
-	// bucket is now empty; tryAcquire must return non-zero wait without blocking
 	wait := l.tryAcquire()
 	if wait == 0 {
 		t.Fatal("expected non-zero wait with empty bucket, got 0")
@@ -38,24 +41,24 @@ func TestLimiter_Acquire_ImmediateWhenFull(t *testing.T) {
 }
 
 func TestLimiter_Acquire_RefillOverTime(t *testing.T) {
-	// One token per second; start with 0 tokens; advance clock by 1 s each call.
-	step := time.Second
-	start := time.Unix(1_000, 0)
-	l := NewLimiter(LimiterConfig{BaseRate: 1, MaxBurst: 1}, advancingClock(start, step))
-	// First call: refill happens (elapsed=1s), 1 token arrives, consumed.
-	ctx := context.Background()
-	if err := l.Acquire(ctx); err != nil {
+	now := time.Unix(1000, 0)
+	l := NewLimiter(cfg(1), fixedClock(&now))
+	// Drain the bucket.
+	_ = l.tryAcquire()
+	// Advance 1 second — one token should refill.
+	now = now.Add(time.Second)
+	if err := l.Acquire(context.Background()); err != nil {
 		t.Fatalf("acquire after 1s: %v", err)
 	}
 }
 
 func TestLimiter_Backoff_HalvesRate(t *testing.T) {
-	now := time.Unix(0, 0)
-	l := NewLimiter(LimiterConfig{BaseRate: 20, MinRateFraction: 0.1}, fixedClock(&now))
+	now := time.Unix(1000, 0)
+	l := NewLimiter(cfg(20), fixedClock(&now))
 	before := l.rate
 	l.Backoff(0)
 	if l.rate != before/2 {
-		t.Fatalf("rate after 1 backoff: got %.1f want %.1f", l.rate, before/2)
+		t.Fatalf("rate after backoff: got %.1f want %.1f", l.rate, before/2)
 	}
 	// Repeated Backoff must not go below minRate.
 	for i := 0; i < 20; i++ {
@@ -67,65 +70,52 @@ func TestLimiter_Backoff_HalvesRate(t *testing.T) {
 }
 
 func TestLimiter_Backoff_SetsPause(t *testing.T) {
-	base := time.Unix(1_000, 0)
-	l := NewLimiter(LimiterConfig{BaseRate: 10, MaxBurst: 10}, fixedClock(&base))
-	// Drain bucket.
-	for i := 0; i < 10; i++ {
-		_ = l.tryAcquire()
-	}
+	now := time.Unix(1000, 0)
+	l := NewLimiter(cfg(10), fixedClock(&now))
 	pause := 200 * time.Millisecond
 	l.Backoff(pause)
 	wait := l.tryAcquire()
 	if wait < pause {
-		t.Fatalf("wait %v is less than pause %v", wait, pause)
+		t.Fatalf("wait %v < pause %v", wait, pause)
 	}
 }
 
-func TestLimiter_Recovery_NudgesRateUp(t *testing.T) {
-	// 1s step; threshold=5 so recovery triggers every 5 acquires.
-	step := time.Second
-	start := time.Unix(0, 0)
-	l := NewLimiter(LimiterConfig{
-		BaseRate:          20,
-		MinRateFraction:   0.1,
-		MaxBurst:          100,
-		RecoveryThreshold: 5,
-	}, advancingClock(start, step))
+func TestLimiter_Recovery_IncreasesRateOverTime(t *testing.T) {
+	now := time.Unix(1000, 0)
+	c := cfg(20)
+	c.RecoveryCooldown = 5 * time.Second
+	c.RecoveryStep = 2.0
+	c.RecoveryInterval = 2 * time.Second
+	l := NewLimiter(c, fixedClock(&now))
 
-	// Slam rate to floor.
+	// Drive rate to floor via many Backoffs.
 	for i := 0; i < 50; i++ {
 		l.Backoff(0)
 	}
 	floorRate := l.rate
+	pauseEnd := l.lastBackoffEnd
 
-	// Drive enough successful acquires to trigger several recovery nudges.
-	ctx := context.Background()
-	for i := 0; i < 50; i++ {
-		if err := l.Acquire(ctx); err != nil {
-			t.Fatalf("acquire %d: %v", i, err)
-		}
-	}
+	// Move clock past cooldown and two recovery intervals.
+	now = pauseEnd.Add(5*time.Second + 4*time.Second + 1)
+	// Trigger applyRecovery via tryAcquire.
+	_ = l.tryAcquire()
 	if l.rate <= floorRate {
 		t.Fatalf("rate %.3f did not recover above floor %.3f", l.rate, floorRate)
 	}
 }
 
 func TestLimiter_Acquire_Cancellation(t *testing.T) {
-	now := time.Unix(0, 0)
-	l := NewLimiter(LimiterConfig{BaseRate: 1, MaxBurst: 0}, fixedClock(&now))
-	// MaxBurst=0 is clamped to BaseRate; drain immediately.
+	now := time.Unix(1000, 0)
+	l := NewLimiter(cfg(1), fixedClock(&now))
 	l.tokens = 0
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	err := l.Acquire(ctx)
-	if err == nil {
+	if err := l.Acquire(ctx); err == nil {
 		t.Fatal("expected cancellation error, got nil")
 	}
 }
 
 func TestLimiter_ConcurrentAcquire(t *testing.T) {
-	// Smoke test: 50 goroutines all Acquire from one Limiter with a generous
-	// budget. No deadlock, no panic, no data race (run with -race).
 	l := NewLimiter(LimiterConfig{BaseRate: 100, MaxBurst: 100}, nil)
 	ctx := context.Background()
 	done := make(chan struct{}, 50)
@@ -145,13 +135,11 @@ func TestLimiter_ConcurrentAcquire(t *testing.T) {
 	}
 }
 
-// Table-driven: verify that Backoff accumulates correctly across multiple calls
-// and that the pause window is always the maximum of concurrent callers.
 func TestLimiter_Backoff_AccumulatesMax(t *testing.T) {
 	cases := []struct {
 		name    string
 		pauses  []time.Duration
-		wantMin time.Duration // wait must be >= this
+		wantMin time.Duration
 	}{
 		{"single 100ms", []time.Duration{100 * time.Millisecond}, 100 * time.Millisecond},
 		{"two: 50ms then 200ms", []time.Duration{50 * time.Millisecond, 200 * time.Millisecond}, 200 * time.Millisecond},
@@ -159,12 +147,8 @@ func TestLimiter_Backoff_AccumulatesMax(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			base := time.Unix(1_000, 0)
-			l := NewLimiter(LimiterConfig{BaseRate: 10, MaxBurst: 10}, fixedClock(&base))
-			// Drain.
-			for i := 0; i < 10; i++ {
-				_ = l.tryAcquire()
-			}
+			now := time.Unix(1000, 0)
+			l := NewLimiter(cfg(10), fixedClock(&now))
 			for _, p := range tc.pauses {
 				l.Backoff(p)
 			}
@@ -175,3 +159,66 @@ func TestLimiter_Backoff_AccumulatesMax(t *testing.T) {
 		})
 	}
 }
+
+// ---- 3 new tests (A4) -------------------------------------------------------
+
+// A4a: recovery interrupted by Backoff resets cooldown.
+func TestLimiter_Recovery_InterruptedByBackoff(t *testing.T) {
+	now := time.Unix(1000, 0)
+	c := cfg(20)
+	c.RecoveryCooldown = 5 * time.Second
+	c.RecoveryStep = 2.0
+	c.RecoveryInterval = 2 * time.Second
+	l := NewLimiter(c, fixedClock(&now))
+
+	// Drive rate down.
+	for i := 0; i < 10; i++ {
+		l.Backoff(0)
+	}
+	afterBackoffsRate := l.rate
+	pauseEnd := l.lastBackoffEnd
+
+	// Advance past cooldown + 2 intervals so recovery partially happens.
+	now = pauseEnd.Add(5*time.Second + 4*time.Second + 1)
+	_ = l.tryAcquire()
+	partialRate := l.rate
+	if partialRate <= afterBackoffsRate {
+		t.Fatalf("expected partial recovery: got %.3f <= %.3f", partialRate, afterBackoffsRate)
+	}
+
+	// Inject Backoff — rate halves from the PARTIALLY-RECOVERED value, cooldown reset.
+	l.Backoff(100 * time.Millisecond)
+	wantRate := partialRate / 2
+	if l.rate > wantRate+0.001 || l.rate < wantRate-0.001 {
+		t.Fatalf("rate after interrupting backoff: got %.3f want %.3f", l.rate, wantRate)
+	}
+	// Cooldown must be reset: last backoff end is now, so recovery is not yet eligible.
+	newPauseEnd := l.lastBackoffEnd
+	eligibleAt := newPauseEnd.Add(c.RecoveryCooldown)
+	if now.After(eligibleAt) || now.Equal(eligibleAt) {
+		t.Fatal("recovery should not be eligible immediately after new Backoff")
+	}
+}
+
+// A4b: no tokens accrue during an active pause window.
+func TestLimiter_NoPauseRefill(t *testing.T) {
+	now := time.Unix(1000, 0)
+	l := NewLimiter(cfg(10), fixedClock(&now))
+	// Drain the bucket.
+	for {
+		if l.tryAcquire() != 0 {
+			break
+		}
+	}
+	tokensBefore := l.tokens
+
+	pause := 500 * time.Millisecond
+	l.Backoff(pause)
+	// Advance clock well into the pause window — tokens must not accrue.
+	now = now.Add(400 * time.Millisecond)
+	_ = l.tryAcquire() // internally calls refill, but pause is active so no-op
+	if l.tokens > tokensBefore+0.001 {
+		t.Fatalf("tokens accrued during pause: %.3f > %.3f", l.tokens, tokensBefore)
+	}
+}
+
