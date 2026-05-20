@@ -16,7 +16,10 @@ type LimiterConfig struct {
 	MaxBurst float64
 
 	// RecoveryCooldown is how long after the last pause window ends before
-	// additive rate recovery begins. Default: 5s.
+	// additive rate recovery begins.
+	// TUNING KNOB: 5s default is deliberately conservative — a short cooldown
+	// lets a still-throttled account hammer EC2 again too quickly. Raise to 30s
+	// or more for accounts that see sustained throttle bursts.
 	RecoveryCooldown time.Duration
 	// RecoveryStep is the tokens/s added per RecoveryInterval of elapsed time
 	// once recovery is eligible. Default: 1 token/s per interval.

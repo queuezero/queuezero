@@ -5,7 +5,6 @@ import (
 	"errors"
 	"net"
 	"net/url"
-	"strings"
 
 	smithy "github.com/aws/smithy-go"
 
@@ -23,17 +22,15 @@ var awsFaultTable = map[string]cohort.FaultClass{
 	// --- RetryableConsistency: propagation lag, not failure -----------------
 
 	// Fresh-resource consistency gaps: IAM profile, AMI, SG, subnet, ENI all
-	// take seconds to propagate to RunInstances after creation.
+	// take seconds to propagate after creation.
 	"InvalidInstanceID.NotFound":                        cohort.FaultRetryableConsistency,
 	"InvalidAMIID.NotFound":                             cohort.FaultRetryableConsistency,
 	"InvalidGroup.NotFound":                             cohort.FaultRetryableConsistency,
 	"InvalidSubnetID.NotFound":                          cohort.FaultRetryableConsistency,
 	"InvalidNetworkInterfaceID.NotFound":                cohort.FaultRetryableConsistency,
 	"InvalidParameterValue.IamInstanceProfileNotReady": cohort.FaultRetryableConsistency,
-	// Placement group may not be visible immediately after creation.
-	"InvalidPlacementGroup.NotFound": cohort.FaultRetryableConsistency,
-	// Key pair consistency gap.
-	"InvalidKeyPair.NotFound": cohort.FaultRetryableConsistency,
+	"InvalidPlacementGroup.NotFound":                    cohort.FaultRetryableConsistency,
+	"InvalidKeyPair.NotFound":                           cohort.FaultRetryableConsistency,
 
 	// --- Throttle: slow the whole client ------------------------------------
 
@@ -41,30 +38,25 @@ var awsFaultTable = map[string]cohort.FaultClass{
 	"Throttling":            cohort.FaultThrottle,
 	"ThrottlingException":   cohort.FaultThrottle,
 	"EC2ThrottledException": cohort.FaultThrottle,
-	// Service-level throttle on Describe calls.
-	"RequestExpired": cohort.FaultThrottle,
+	"RequestExpired":        cohort.FaultThrottle,
 
 	// --- CapacityExhausted: advance the chain, never retry in place ---------
-	// NOTE: purchase-model-independent. Plain on-demand RunInstances ICEs too.
-	// There is no safe baseline — only a chain of rungs with different ICE
-	// probabilities (ARCHITECTURE §5, §7).
+	// Purchase-model-independent: plain on-demand RunInstances ICEs too.
+	// There is no safe baseline — only a chain of rungs (ARCHITECTURE §5, §7).
 
-	"InsufficientInstanceCapacity": cohort.FaultCapacityExhausted,
-	"InsufficientHostCapacity":      cohort.FaultCapacityExhausted,
-	// Spot-specific capacity signals — treat as "this rung unavailable".
-	"SpotMaxPriceTooLow":             cohort.FaultCapacityExhausted,
-	"MaxSpotInstanceCountExceeded":   cohort.FaultCapacityExhausted,
-	"InsufficientFreeAddressesInSubnet": cohort.FaultCapacityExhausted,
-	// Instance type not offered in this AZ — advance the chain.
-	"Unsupported": cohort.FaultCapacityExhausted,
+	"InsufficientInstanceCapacity":      cohort.FaultCapacityExhausted,
+	"InsufficientHostCapacity":           cohort.FaultCapacityExhausted,
+	"SpotMaxPriceTooLow":                 cohort.FaultCapacityExhausted,
+	"MaxSpotInstanceCountExceeded":       cohort.FaultCapacityExhausted,
+	"InsufficientFreeAddressesInSubnet":  cohort.FaultCapacityExhausted,
+	"Unsupported":                        cohort.FaultCapacityExhausted,
 
 	// --- Terminal: fail immediately, loud -----------------------------------
-	// These are misconfiguration or hard limits; retrying will not help.
 
 	"UnauthorizedOperation":       cohort.FaultTerminal,
 	"AccessDenied":                cohort.FaultTerminal,
 	"AuthFailure":                 cohort.FaultTerminal,
-	"InstanceLimitExceeded":       cohort.FaultTerminal, // quota, not capacity
+	"InstanceLimitExceeded":       cohort.FaultTerminal,
 	"VcpuLimitExceeded":           cohort.FaultTerminal,
 	"InvalidParameterValue":       cohort.FaultTerminal,
 	"InvalidParameterCombination": cohort.FaultTerminal,
@@ -77,18 +69,50 @@ var awsFaultTable = map[string]cohort.FaultClass{
 // Classify implements cohort.Classifier.
 //
 // Classification order:
-//  1. Unwrap to smithy.APIError — extract verbatim code + message.
-//  2. Look up awsFaultTable; default unmapped codes → FaultTerminal.
-//  3. Transport-level errors (timeout, connection reset, 5xx without a
-//     structured code) → FaultAmbiguous. The substrate.Client (Step 3) is
-//     responsible for collapsing FaultAmbiguous via idempotency-token retry
-//     before it ever reaches the cohort reconciler.
+//  1. context.Canceled → FaultTerminal. We cancelled: no retry, no orphan launch.
+//  2. context.DeadlineExceeded → FaultAmbiguous. Call timed out; mutation status
+//     genuinely unknown. substrate.Client collapses this via idempotency token.
+//  3. Typed transport error (net.Error, url.Error) → FaultAmbiguous.
+//  4. Structured smithy.APIError → table lookup; unmapped → FaultTerminal.
+//  5. Anything else → FaultTerminal.
 func (Classifier) Classify(err error) cohort.Fault {
 	if err == nil {
 		return cohort.Fault{Class: cohort.FaultRetryableConsistency}
 	}
 
-	// 1. Try to unwrap a structured API error.
+	// 1. WE cancelled — shutdown or cohort fast-fail. Do NOT retry: firing a
+	//    fresh RunInstances on the way out creates an orphan nobody reconciles.
+	if errors.Is(err, context.Canceled) {
+		return cohort.Fault{
+			Class:     cohort.FaultTerminal,
+			Code:      "ContextCanceled",
+			Retryable: false,
+			Message:   err.Error(),
+		}
+	}
+
+	// 2. Call timed out — mutation may or may not have landed.
+	//    substrate.Client re-issues with the same idempotency token to resolve.
+	if errors.Is(err, context.DeadlineExceeded) {
+		return cohort.Fault{
+			Class:     cohort.FaultAmbiguous,
+			Code:      "ContextDeadlineExceeded",
+			Retryable: false,
+			Message:   err.Error(),
+		}
+	}
+
+	// 3. Typed transport error — mutation status unknown, same resolution path.
+	if isTypedTransportError(err) {
+		return cohort.Fault{
+			Class:     cohort.FaultAmbiguous,
+			Code:      "TransportError",
+			Retryable: false,
+			Message:   err.Error(),
+		}
+	}
+
+	// 4. Structured AWS API error — verbatim code preserved.
 	var apiErr smithy.APIError
 	if errors.As(err, &apiErr) {
 		code := apiErr.ErrorCode()
@@ -105,18 +129,7 @@ func (Classifier) Classify(err error) cohort.Fault {
 		}
 	}
 
-	// 2. Transport-level signals → FaultAmbiguous.
-	//    Mutation status is unknown; the idempotency token (Step 3) resolves it.
-	if isTransportError(err) {
-		return cohort.Fault{
-			Class:     cohort.FaultAmbiguous,
-			Code:      "TransportError",
-			Retryable: false,
-			Message:   err.Error(),
-		}
-	}
-
-	// 3. Unrecognised error type — treat as terminal to avoid hanging.
+	// 5. Unrecognised — terminal to avoid hanging on an unknown condition.
 	return cohort.Fault{
 		Class:     cohort.FaultTerminal,
 		Code:      "UnknownError",
@@ -125,18 +138,13 @@ func (Classifier) Classify(err error) cohort.Fault {
 	}
 }
 
-// isTransportError returns true for network-level failures where the mutation
-// status is unknown: timeouts, connection resets, and HTTP 5xx responses that
-// did not produce a structured API error body.
-func isTransportError(err error) bool {
-	msg := strings.ToLower(err.Error())
-
-	// Context deadline / timeout.
-	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
-		return true
-	}
-
-	// Net-level: connection reset, refused, EOF, timeout.
+// isTypedTransportError returns true for network-level failures using only
+// typed interface checks — no string matching. String matching is the
+// anti-pattern the taxonomy exists to kill: brittle across SDK versions and
+// locales. net.Error and url.Error cover the transport errors the smithy HTTP
+// client and net/http layer produce on connection failure, reset, and timeout.
+// context sentinels are handled before this function is reached.
+func isTypedTransportError(err error) bool {
 	var netErr net.Error
 	if errors.As(err, &netErr) {
 		return true
@@ -145,18 +153,5 @@ func isTransportError(err error) bool {
 	if errors.As(err, &urlErr) {
 		return true
 	}
-
-	// String-level fallback for smithy transport errors that wrap without
-	// implementing a typed interface.
-	for _, fragment := range []string{
-		"connection reset", "connection refused", "broken pipe",
-		"eof", "i/o timeout", "no such host",
-		"tls handshake", "context deadline exceeded", "context canceled",
-	} {
-		if strings.Contains(msg, fragment) {
-			return true
-		}
-	}
 	return false
 }
-

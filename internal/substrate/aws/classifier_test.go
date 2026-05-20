@@ -13,31 +13,29 @@ import (
 	"github.com/queuezero/queuezero/internal/cohort"
 )
 
-// syntheticAPIErr builds a minimal smithy.APIError.
+// syntheticAPIErr is a minimal smithy.APIError.
 type syntheticAPIErr struct {
 	code    string
 	message string
 	fault   smithy.ErrorFault
 }
 
-func (e *syntheticAPIErr) Error() string        { return fmt.Sprintf("%s: %s", e.code, e.message) }
-func (e *syntheticAPIErr) ErrorCode() string    { return e.code }
-func (e *syntheticAPIErr) ErrorMessage() string { return e.message }
+func (e *syntheticAPIErr) Error() string             { return fmt.Sprintf("%s: %s", e.code, e.message) }
+func (e *syntheticAPIErr) ErrorCode() string         { return e.code }
+func (e *syntheticAPIErr) ErrorMessage() string      { return e.message }
 func (e *syntheticAPIErr) ErrorFault() smithy.ErrorFault { return e.fault }
 
 func apiErr(code, msg string) error {
 	return &syntheticAPIErr{code: code, message: msg, fault: smithy.FaultServer}
 }
 
-// wrappedAPIErr wraps a smithy.APIError inside a plain error so errors.As is
-// exercised, not just a direct type assertion.
 func wrappedAPIErr(code, msg string) error {
 	return fmt.Errorf("ec2 operation failed: %w", apiErr(code, msg))
 }
 
 var clf = Classifier{}
 
-// Table: every structured code in awsFaultTable plus unknown → Terminal.
+// Every structured code in awsFaultTable, plus unmapped → Terminal.
 func TestClassifier_StructuredCodes(t *testing.T) {
 	cases := []struct {
 		code      string
@@ -52,14 +50,12 @@ func TestClassifier_StructuredCodes(t *testing.T) {
 		{"InvalidParameterValue.IamInstanceProfileNotReady", cohort.FaultRetryableConsistency},
 		{"InvalidPlacementGroup.NotFound", cohort.FaultRetryableConsistency},
 		{"InvalidKeyPair.NotFound", cohort.FaultRetryableConsistency},
-
 		// Throttle
 		{"RequestLimitExceeded", cohort.FaultThrottle},
 		{"Throttling", cohort.FaultThrottle},
 		{"ThrottlingException", cohort.FaultThrottle},
 		{"EC2ThrottledException", cohort.FaultThrottle},
 		{"RequestExpired", cohort.FaultThrottle},
-
 		// CapacityExhausted
 		{"InsufficientInstanceCapacity", cohort.FaultCapacityExhausted},
 		{"InsufficientHostCapacity", cohort.FaultCapacityExhausted},
@@ -67,8 +63,7 @@ func TestClassifier_StructuredCodes(t *testing.T) {
 		{"MaxSpotInstanceCountExceeded", cohort.FaultCapacityExhausted},
 		{"InsufficientFreeAddressesInSubnet", cohort.FaultCapacityExhausted},
 		{"Unsupported", cohort.FaultCapacityExhausted},
-
-		// Terminal
+		// Terminal — explicit
 		{"UnauthorizedOperation", cohort.FaultTerminal},
 		{"AccessDenied", cohort.FaultTerminal},
 		{"AuthFailure", cohort.FaultTerminal},
@@ -80,8 +75,7 @@ func TestClassifier_StructuredCodes(t *testing.T) {
 		{"InvalidSpotInstanceRequest", cohort.FaultTerminal},
 		{"InvalidBlockDeviceMapping", cohort.FaultTerminal},
 		{"InvalidInstanceType", cohort.FaultTerminal},
-
-		// Unknown code → Terminal (fail loud, never hang)
+		// Unmapped → Terminal
 		{"SomeCompletelyUnknownCode", cohort.FaultTerminal},
 		{"", cohort.FaultTerminal},
 	}
@@ -91,7 +85,6 @@ func TestClassifier_StructuredCodes(t *testing.T) {
 			if f.Class != tc.wantClass {
 				t.Errorf("code=%q: got class %v want %v", tc.code, f.Class, tc.wantClass)
 			}
-			// Verbatim code must be preserved.
 			if f.Code != tc.code {
 				t.Errorf("code=%q: Fault.Code=%q (paraphrased)", tc.code, f.Code)
 			}
@@ -99,7 +92,25 @@ func TestClassifier_StructuredCodes(t *testing.T) {
 	}
 }
 
-// errors.As must work through a wrapping layer.
+// A3: unmapped code must carry the VERBATIM AWS code, not "unknown" or empty.
+func TestClassifier_UnmappedCodeVerbatim(t *testing.T) {
+	codes := []string{
+		"SomeFutureEC2Code",
+		"InvalidFoo.Bar",
+		"WeirdNewThrottleVariant",
+	}
+	for _, code := range codes {
+		f := clf.Classify(apiErr(code, "some message"))
+		if f.Class != cohort.FaultTerminal {
+			t.Errorf("code=%q: got class %v want Terminal", code, f.Class)
+		}
+		if f.Code != code {
+			t.Errorf("code=%q: Fault.Code=%q — verbatim code not preserved", code, f.Code)
+		}
+	}
+}
+
+// errors.As must unwrap through a wrapping layer.
 func TestClassifier_WrappedAPIErr(t *testing.T) {
 	f := clf.Classify(wrappedAPIErr("InsufficientInstanceCapacity", "no capacity"))
 	if f.Class != cohort.FaultCapacityExhausted {
@@ -110,17 +121,15 @@ func TestClassifier_WrappedAPIErr(t *testing.T) {
 	}
 }
 
-// Retryable flag: true iff Consistency or Throttle.
+// Retryable is true iff Consistency or Throttle.
 func TestClassifier_RetryableFlag(t *testing.T) {
-	retryable := []string{"InvalidInstanceID.NotFound", "RequestLimitExceeded"}
-	for _, code := range retryable {
+	for _, code := range []string{"InvalidInstanceID.NotFound", "RequestLimitExceeded"} {
 		f := clf.Classify(apiErr(code, ""))
 		if !f.Retryable {
 			t.Errorf("code=%q: want Retryable=true", code)
 		}
 	}
-	notRetryable := []string{"InsufficientInstanceCapacity", "UnauthorizedOperation", "SomeUnknown"}
-	for _, code := range notRetryable {
+	for _, code := range []string{"InsufficientInstanceCapacity", "UnauthorizedOperation", "SomeUnknown"} {
 		f := clf.Classify(apiErr(code, ""))
 		if f.Retryable {
 			t.Errorf("code=%q: want Retryable=false", code)
@@ -128,35 +137,83 @@ func TestClassifier_RetryableFlag(t *testing.T) {
 	}
 }
 
-// Transport-level errors → FaultAmbiguous.
-func TestClassifier_TransportErrors(t *testing.T) {
-	netTimeout := &net.OpError{
-		Op:  "dial",
-		Err: &timeoutError{},
+// A1: context.Canceled → Terminal (WE cancelled — no retry, no orphan launch).
+func TestClassifier_ContextCanceled_IsTerminal(t *testing.T) {
+	f := clf.Classify(context.Canceled)
+	if f.Class != cohort.FaultTerminal {
+		t.Errorf("context.Canceled: got %v want Terminal", f.Class)
 	}
-	cases := []struct {
+	if f.Retryable {
+		t.Errorf("context.Canceled: want Retryable=false")
+	}
+	if f.Code != "ContextCanceled" {
+		t.Errorf("context.Canceled: Code=%q want ContextCanceled", f.Code)
+	}
+}
+
+// A1: context.DeadlineExceeded → Ambiguous (call may have landed).
+func TestClassifier_ContextDeadlineExceeded_IsAmbiguous(t *testing.T) {
+	f := clf.Classify(context.DeadlineExceeded)
+	if f.Class != cohort.FaultAmbiguous {
+		t.Errorf("context.DeadlineExceeded: got %v want Ambiguous", f.Class)
+	}
+	if f.Code != "ContextDeadlineExceeded" {
+		t.Errorf("context.DeadlineExceeded: Code=%q", f.Code)
+	}
+}
+
+// Wrapped context sentinels must also classify correctly.
+func TestClassifier_WrappedContextSentinels(t *testing.T) {
+	wrappedCanceled := fmt.Errorf("op failed: %w", context.Canceled)
+	f := clf.Classify(wrappedCanceled)
+	if f.Class != cohort.FaultTerminal {
+		t.Errorf("wrapped Canceled: got %v want Terminal", f.Class)
+	}
+
+	wrappedDeadline := fmt.Errorf("op failed: %w", context.DeadlineExceeded)
+	f = clf.Classify(wrappedDeadline)
+	if f.Class != cohort.FaultAmbiguous {
+		t.Errorf("wrapped DeadlineExceeded: got %v want Ambiguous", f.Class)
+	}
+}
+
+// A2: transport errors use TYPED checks only (net.Error, url.Error).
+func TestClassifier_TypedTransportErrors(t *testing.T) {
+	netTimeout := &net.OpError{Op: "dial", Err: &timeoutError{}}
+	urlErr := &url.Error{Op: "Get", URL: "https://ec2.amazonaws.com", Err: errors.New("conn refused")}
+
+	for _, tc := range []struct {
 		name string
 		err  error
 	}{
-		{"context deadline", context.DeadlineExceeded},
-		{"context canceled", context.Canceled},
-		{"net timeout", netTimeout},
-		{"url error", &url.Error{Op: "Get", URL: "https://ec2.amazonaws.com", Err: errors.New("connection reset by peer")}},
-		{"plain connection reset", errors.New("connection reset by peer")},
-		{"plain eof", errors.New("unexpected EOF")},
-		{"io timeout string", errors.New("i/o timeout")},
-	}
-	for _, tc := range cases {
+		{"net.Error", netTimeout},
+		{"url.Error", urlErr},
+	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := clf.Classify(tc.err)
 			if f.Class != cohort.FaultAmbiguous {
-				t.Errorf("%s: got %v want FaultAmbiguous", tc.name, f.Class)
+				t.Errorf("%s: got %v want Ambiguous", tc.name, f.Class)
 			}
 		})
 	}
 }
 
-// nil error → RetryableConsistency (defensive; caller should not pass nil).
+// Plain strings that look like transport errors are NOT special — terminal.
+func TestClassifier_PlainStringErrors_AreTerminal(t *testing.T) {
+	for _, msg := range []string{
+		"connection reset by peer",
+		"unexpected EOF",
+		"i/o timeout",
+		"no such host",
+	} {
+		f := clf.Classify(errors.New(msg))
+		if f.Class != cohort.FaultTerminal {
+			t.Errorf("plain string %q: got %v want Terminal (no string matching)", msg, f.Class)
+		}
+	}
+}
+
+// nil → RetryableConsistency (defensive).
 func TestClassifier_NilError(t *testing.T) {
 	f := clf.Classify(nil)
 	if f.Class != cohort.FaultRetryableConsistency {
@@ -172,7 +229,7 @@ func TestClassifier_UnknownPlainError(t *testing.T) {
 	}
 }
 
-// timeoutError implements net.Error for test purposes.
+// timeoutError implements net.Error.
 type timeoutError struct{}
 
 func (t *timeoutError) Error() string   { return "i/o timeout" }

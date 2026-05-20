@@ -31,14 +31,24 @@ func DefaultBackoffPolicy() BackoffPolicy {
 // Duration returns the backoff duration for attempt (0-indexed).
 // Computes base × 2^attempt, caps at Cap, then adds uniform jitter in
 // [0, Jitter × capped). Result is bounded by Cap × (1 + Jitter).
+//
+// Overflow guard: the comparison is done in float64 before converting to
+// time.Duration. math.Pow(2, large) produces +Inf in float64, and
+// time.Duration(+Inf) wraps to a nonsense value. By comparing the float64
+// product to float64(Cap) first, we cap before any conversion occurs.
 func (p BackoffPolicy) Duration(attempt int) time.Duration {
 	if attempt < 0 {
 		attempt = 0
 	}
-	d := time.Duration(float64(p.Base) * math.Pow(2, float64(attempt)))
-	if d > p.Cap || d < 0 { // d<0 guards int64 overflow at high attempt counts
-		d = p.Cap
+	capF := float64(p.Cap)
+	raw := float64(p.Base) * math.Pow(2, float64(attempt))
+	// Guard: +Inf, NaN, or any value exceeding Cap → use Cap before converting.
+	if raw >= capF || math.IsInf(raw, 0) || math.IsNaN(raw) {
+		d := p.Cap
+		jitter := time.Duration(float64(d) * p.Jitter * rand.Float64())
+		return d + jitter
 	}
+	d := time.Duration(raw)
 	jitter := time.Duration(float64(d) * p.Jitter * rand.Float64())
 	return d + jitter
 }
