@@ -6,6 +6,13 @@ import (
 	"time"
 )
 
+// LimiterIface is the interface the AWS Client accepts, allowing tests to
+// inject a fake without depending on the concrete *Limiter type.
+type LimiterIface interface {
+	Acquire(ctx context.Context) error
+	Backoff(d time.Duration)
+}
+
 // LimiterConfig tunes a Limiter; zero values use safe defaults.
 type LimiterConfig struct {
 	// BaseRate is the unconstrained refill rate in tokens/s. Default: 20.
