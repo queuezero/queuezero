@@ -177,6 +177,27 @@ func TestClassifier_WrappedContextSentinels(t *testing.T) {
 	}
 }
 
+// A1 explicit: wrapped DeadlineExceeded (e.g. from SDK layer) → Ambiguous.
+func TestClassifier_WrappedDeadlineExceeded_IsAmbiguous(t *testing.T) {
+	err := fmt.Errorf("launch failed: %w", context.DeadlineExceeded)
+	f := clf.Classify(err)
+	if f.Class != cohort.FaultAmbiguous {
+		t.Errorf("wrapped DeadlineExceeded: got %v want Ambiguous — genuinely ambiguous call must not be marked terminal", f.Class)
+	}
+}
+
+// A1 explicit: net.Error with Timeout()==true → Ambiguous.
+func TestClassifier_NetErrorTimeout_IsAmbiguous(t *testing.T) {
+	err := &net.OpError{Op: "dial", Err: &timeoutError{}}
+	f := clf.Classify(err)
+	if f.Class != cohort.FaultAmbiguous {
+		t.Errorf("net.Error(Timeout=true): got %v want Ambiguous — must not be marked terminal", f.Class)
+	}
+	if f.Class == cohort.FaultTerminal {
+		t.Errorf("net.Error(Timeout=true) → Terminal would mark a genuinely ambiguous call as never-retry, inverse of the context.Canceled bug")
+	}
+}
+
 // A2: transport errors use TYPED checks only (net.Error, url.Error).
 func TestClassifier_TypedTransportErrors(t *testing.T) {
 	netTimeout := &net.OpError{Op: "dial", Err: &timeoutError{}}

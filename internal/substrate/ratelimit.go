@@ -6,12 +6,6 @@ import (
 	"time"
 )
 
-// LimiterIface is the interface the AWS Client accepts, allowing tests to
-// inject a fake without depending on the concrete *Limiter type.
-type LimiterIface interface {
-	Acquire(ctx context.Context) error
-	Backoff(d time.Duration)
-}
 
 // LimiterConfig tunes a Limiter; zero values use safe defaults.
 type LimiterConfig struct {
@@ -24,9 +18,10 @@ type LimiterConfig struct {
 
 	// RecoveryCooldown is how long after the last pause window ends before
 	// additive rate recovery begins.
-	// TUNING KNOB: 5s default is deliberately conservative — a short cooldown
-	// lets a still-throttled account hammer EC2 again too quickly. Raise to 30s
-	// or more for accounts that see sustained throttle bursts.
+	// TUNING KNOB: 5s default is deliberately conservative.
+	// Mistuning symptoms: if throttling re-trips immediately after a resume wave,
+	// this is too short — raise to 30s or more. If the account is underutilized
+	// for minutes after a transient blip, this is too long — lower toward 2-5s.
 	RecoveryCooldown time.Duration
 	// RecoveryStep is the tokens/s added per RecoveryInterval of elapsed time
 	// once recovery is eligible. Default: 1 token/s per interval.

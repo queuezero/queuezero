@@ -31,9 +31,17 @@ var throttleBackoff = cohort.BackoffPolicy{
 	Jitter: 0.2,
 }
 
+// limiterIface is unexported so it cannot be satisfied from outside this
+// package. The production path forces a real *substrate.Limiter through
+// NewClient; only in-package tests can inject an alternative via newClientForTest.
+type limiterIface interface {
+	Acquire(ctx context.Context) error
+	Backoff(d time.Duration)
+}
+
 // Client is the single chokepoint to AWS EC2 for queuezero. It owns:
 //   - idempotency tokens on every mutation (via substrate.Token)
-//   - rate limiting (via substrate.LimiterIface)
+//   - rate limiting (via a *substrate.Limiter — not bypassable from outside)
 //   - fault classification (via aws.Classifier)
 //   - two bounded retry loops: Throttle and Ambiguous
 //
@@ -42,13 +50,20 @@ var throttleBackoff = cohort.BackoffPolicy{
 // FaultAmbiguous — those are consumed here.
 type Client struct {
 	ec2     EC2API
-	limiter substrate.LimiterIface
+	limiter limiterIface
 	clf     Classifier
 }
 
-// NewClient constructs a Client. ec2api is typically *ec2.Client from
-// aws-sdk-go-v2; tests inject a fake.
-func NewClient(ec2api EC2API, limiter substrate.LimiterIface) *Client {
+// NewClient is the production constructor. Taking *substrate.Limiter (not an
+// interface) ensures the rate-limiting chokepoint cannot be bypassed by an
+// external caller — there is no public interface to satisfy with a no-op.
+func NewClient(ec2api EC2API, limiter *substrate.Limiter) *Client {
+	return &Client{ec2: ec2api, limiter: limiter}
+}
+
+// newClientForTest is package-internal; used only in *_test.go files in this
+// package to inject a counting/fake limiter. Not callable from outside aws/.
+func newClientForTest(ec2api EC2API, limiter limiterIface) *Client {
 	return &Client{ec2: ec2api, limiter: limiter}
 }
 
@@ -196,14 +211,25 @@ func (c *Client) callWithRetry(ctx context.Context, fn func(context.Context) err
 
 		switch f.Class {
 		case cohort.FaultThrottle:
-			if throttleAttempt >= maxThrottleRetries {
-				return faultErr(f)
-			}
+			// Always call Backoff on Throttle — the limiter must remain degraded
+			// for subsequent callers even if this attempt exhausts its budget or
+			// the context has been cancelled. Backoff before checking ctx.
 			d := throttleBackoff.Duration(throttleAttempt)
 			c.limiter.Backoff(d)
 			throttleAttempt++
 			// Reset ambiguous counter: a throttle response confirms the call landed.
 			ambiguousAttempt = 0
+			if throttleAttempt > maxThrottleRetries {
+				return faultErr(f)
+			}
+			// Respect cancellation: a fast-failed cohort must not keep touching EC2.
+			if err := ctx.Err(); err != nil {
+				return faultErr(cohort.Fault{
+					Class:   cohort.FaultTerminal,
+					Code:    "ContextCanceled",
+					Message: "context cancelled during throttle retry: " + err.Error(),
+				})
+			}
 
 		case cohort.FaultAmbiguous:
 			// Re-issue the SAME call with the SAME idempotency token.

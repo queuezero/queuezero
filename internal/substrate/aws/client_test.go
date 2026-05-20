@@ -107,6 +107,10 @@ func newClient(fake *fakeEC2) *Client {
 	return NewClient(fake, newLimiter())
 }
 
+func newClientWithLimiter(fake *fakeEC2, l limiterIface) *Client {
+	return newClientForTest(fake, l)
+}
+
 func runReq(token string) substrate.RunRequest {
 	return substrate.RunRequest{
 		AMI:              "ami-test",
@@ -218,15 +222,12 @@ func assertNotAmbiguous(t *testing.T, err error) {
 // Throttle: Limiter.Backoff is invoked, then a successful retry follows.
 func TestClient_RunInstance_ThrottleThenSuccess(t *testing.T) {
 	var backoffCalled int32
-	l := &backoffCountingLimiter{
-		LimiterIface: newLimiter(),
-		backoffCalls: &backoffCalled,
-	}
+	l := &noopLimiter{backoffCalls: &backoffCalled}
 	fake := &fakeEC2{runResponses: []runResponse{
 		{err: apiErr("Throttling", "rate exceeded")},
 		okRun("i-throttled"),
 	}}
-	c := &Client{ec2: fake, limiter: l}
+	c := newClientWithLimiter(fake, l)
 	inst, err := c.RunInstance(context.Background(), runReq("tok-throttle"))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -335,14 +336,66 @@ func TestClient_RunInstance_ContextCanceled_NoOrphan(t *testing.T) {
 	}
 }
 
-// ---- backoffCountingLimiter -------------------------------------------------
+// A3: cancelled context abandons throttle retry promptly.
+func TestClient_ThrottleRetry_ContextCancelled_Abandons(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // already cancelled
 
-type backoffCountingLimiter struct {
-	substrate.LimiterIface
+	var backoffCalled int32
+	l := &noopLimiter{backoffCalls: &backoffCalled}
+	// Every call returns Throttle — without cancellation check it would spin.
+	responses := make([]runResponse, maxThrottleRetries+2)
+	for i := range responses {
+		responses[i] = runResponse{err: apiErr("Throttling", "rate exceeded")}
+	}
+	c := newClientWithLimiter(&fakeEC2{runResponses: responses}, l)
+	_, err := c.RunInstance(ctx, runReq("tok-ctx-throttle"))
+	if err == nil {
+		t.Fatal("expected error when context cancelled during throttle retry")
+	}
+	var fe *FaultError
+	if errors.As(err, &fe) && fe.Fault.Class == cohort.FaultAmbiguous {
+		t.Error("cancelled throttle retry returned Ambiguous")
+	}
+	// Backoff must have been called at least once — limiter stays degraded.
+	if atomic.LoadInt32(&backoffCalled) == 0 {
+		t.Error("Limiter.Backoff not called — limiter was not degraded for subsequent callers")
+	}
+}
+
+// A3: after exhausting throttle retries, Backoff WAS called on the final
+// failing attempt — the limiter remains degraded for the next caller.
+func TestClient_ThrottleExhausted_LimiterRemainsDegraded(t *testing.T) {
+	var backoffCalled int32
+	l := &noopLimiter{backoffCalls: &backoffCalled}
+	responses := make([]runResponse, maxThrottleRetries+2)
+	for i := range responses {
+		responses[i] = runResponse{err: apiErr("Throttling", "rate exceeded")}
+	}
+	c := newClientWithLimiter(&fakeEC2{runResponses: responses}, l)
+	_, err := c.RunInstance(context.Background(), runReq("tok-throttle-exhaust"))
+	if err == nil {
+		t.Fatal("expected error after throttle exhaustion")
+	}
+	// maxThrottleRetries+1 Backoff calls: one per attempt including the final one.
+	want := int32(maxThrottleRetries + 1)
+	got := atomic.LoadInt32(&backoffCalled)
+	if got != want {
+		t.Errorf("Backoff called %d times want %d (final attempt must degrade limiter)", got, want)
+	}
+}
+
+// ---- test limiter helpers ---------------------------------------------------
+
+// noopLimiter satisfies limiterIface without any real rate limiting — suitable
+// for tests that care about call ordering, not timing.
+type noopLimiter struct {
 	backoffCalls *int32
 }
 
-func (l *backoffCountingLimiter) Backoff(d time.Duration) {
-	atomic.AddInt32(l.backoffCalls, 1)
-	l.LimiterIface.Backoff(d)
+func (l *noopLimiter) Acquire(_ context.Context) error { return nil }
+func (l *noopLimiter) Backoff(_ time.Duration) {
+	if l.backoffCalls != nil {
+		atomic.AddInt32(l.backoffCalls, 1)
+	}
 }
