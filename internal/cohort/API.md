@@ -4,7 +4,8 @@
 movable in coordinated multi-repo commits. v1.0 is earned by the co-proof
 (§7), not declared here.
 
-**Step 5.8 updates:** OQ-1..5 resolved (see §Open Questions at end).
+**Step 5.8 updates:** OQ-1..5 resolved (see §Open Questions at end).  
+**Step 5.9 updates:** three follow-on items resolved; cohort-internal hardening complete.
 
 ---
 
@@ -212,12 +213,26 @@ exported for test injection, marked `TEST-ONLY`.
 ```go
 func NewSerialCohort(id CohortID, member EntityIntent, budget PhaseBudget) (Cohort, error)
 func NewMPICohort(id CohortID, members []EntityIntent, budget PhaseBudget) (Cohort, error)
-func NewPartialCohort(id CohortID, members []EntityIntent, budget PhaseBudget, minViable int) (Cohort, error)
+func NewPartialCohort(id CohortID, members []EntityIntent, budget PhaseBudget, minViable int, asm Assembler) (Cohort, error)
 ```
 
-All three apply `DefaultBudget()` when the passed budget is fully zero (OQ-5).
-`NewMPICohort` sets `MinViable = len(members)` (all-or-nothing contract visible
-at the call site). `NewPartialCohort` validates `0 < minViable ≤ len(members)`.
+All three fill every individually-zero `PhaseBudget` field from `DefaultBudget()`
+(field-by-field, not all-or-nothing — see Step 5.9). `NewMPICohort` sets
+`MinViable = len(members)`. `NewPartialCohort` validates `0 < minViable ≤ len(members)`.
+
+**Step 5.9.1:** `applyDefaultBudget` is now field-by-field: each zero duration
+is filled independently. A partially-set budget (e.g. `Running` set, `CohortBarrier`
+zero) no longer leaves the zero field as an instant deadline.
+
+**Step 5.9.2:** `substrate.Token` implementation deleted; now delegates to
+`cohort.Token`. One canonical implementation, zero drift window. guard-cohort
+confirmed: cohort still imports nothing from substrate.
+
+**Step 5.9.3:** `NewPartialCohort` accepts an `Assembler` parameter and rejects
+non-nil with an explicit error: "partial cohorts do not support an assembly phase."
+`Cohort.NoAssembly bool` field set by the constructor; `Reconcile` checks it and
+returns `AssemblyDisallowed` fault if a Reconciler has a non-nil Assembler and the
+cohort prohibits it. Defense-in-depth: catches callers who bypass the constructor.
 
 `NewEntityIntent` added (token.go + entity.go):
 ```go

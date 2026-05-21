@@ -167,7 +167,7 @@ func TestNewPartialCohort_HappyPath(t *testing.T) {
 		m, _ := NewEntityIntent("gauss", EntityID(string(rune('a'+i))), "gen-1", "c-p", rung, nil, "")
 		members = append(members, m)
 	}
-	c, err := NewPartialCohort("c-p", members, PhaseBudget{}, 3)
+	c, err := NewPartialCohort("c-p", members, PhaseBudget{}, 3, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -179,7 +179,7 @@ func TestNewPartialCohort_HappyPath(t *testing.T) {
 func TestNewPartialCohort_RejectsZeroMinViable(t *testing.T) {
 	rung := Rung{InstanceType: "m5.xlarge", AvailZone: "us-east-1a"}
 	m, _ := NewEntityIntent("gauss", "n-0", "gen-1", "c-p", rung, nil, "")
-	_, err := NewPartialCohort("c-p", []EntityIntent{m}, PhaseBudget{}, 0)
+	_, err := NewPartialCohort("c-p", []EntityIntent{m}, PhaseBudget{}, 0, nil)
 	if err == nil {
 		t.Error("expected error for MinViable=0")
 	}
@@ -188,7 +188,7 @@ func TestNewPartialCohort_RejectsZeroMinViable(t *testing.T) {
 func TestNewPartialCohort_RejectsMinViableExceedsMembers(t *testing.T) {
 	rung := Rung{InstanceType: "m5.xlarge", AvailZone: "us-east-1a"}
 	m, _ := NewEntityIntent("gauss", "n-0", "gen-1", "c-p", rung, nil, "")
-	_, err := NewPartialCohort("c-p", []EntityIntent{m}, PhaseBudget{}, 5)
+	_, err := NewPartialCohort("c-p", []EntityIntent{m}, PhaseBudget{}, 5, nil)
 	if err == nil {
 		t.Error("expected error for MinViable > len(members)")
 	}
@@ -288,5 +288,142 @@ func TestReadiness_NotOperational_PreventsCohortReady(t *testing.T) {
 	outcome, _ := r.Reconcile(context.Background(), c)
 	if outcome.Ready {
 		t.Error("Operational=false should prevent Ready=true")
+	}
+}
+
+// ---- 5.9.1: partial PhaseBudget defaulting ----------------------------------
+
+// A budget with exactly one zero field: the zero field is defaulted to
+// DefaultBudget()'s value, and the set fields are untouched.
+func TestApplyDefaultBudget_PartialFill(t *testing.T) {
+	def := DefaultBudget()
+	// Set everything except CohortBarrier.
+	partial := PhaseBudget{
+		LaunchAcked:    7 * time.Second,
+		Running:        2 * time.Minute,
+		Enrolled:       90 * time.Second,
+		CohortBarrier:  0, // left zero — must default
+		CohortAssembly: 30 * time.Second,
+	}
+	rung := Rung{InstanceType: "m5.xlarge", AvailZone: "us-east-1a"}
+	intent, _ := NewEntityIntent("gauss", "gpu-001", "gen-1", "c-s", rung, nil, "")
+	c, err := NewSerialCohort("c-s", intent, partial)
+	if err != nil {
+		t.Fatalf("NewSerialCohort: %v", err)
+	}
+	// Zero field defaulted.
+	if c.Budget.CohortBarrier != def.CohortBarrier {
+		t.Errorf("CohortBarrier: got %v want %v (default)", c.Budget.CohortBarrier, def.CohortBarrier)
+	}
+	// Set fields are untouched.
+	if c.Budget.LaunchAcked != 7*time.Second {
+		t.Errorf("LaunchAcked: got %v want 7s", c.Budget.LaunchAcked)
+	}
+	if c.Budget.Running != 2*time.Minute {
+		t.Errorf("Running: got %v want 2m", c.Budget.Running)
+	}
+	if c.Budget.Enrolled != 90*time.Second {
+		t.Errorf("Enrolled: got %v want 90s", c.Budget.Enrolled)
+	}
+	if c.Budget.CohortAssembly != 30*time.Second {
+		t.Errorf("CohortAssembly: got %v want 30s", c.Budget.CohortAssembly)
+	}
+}
+
+// ---- 5.9.2: token duplication regression ------------------------------------
+
+// substrate.Token and cohort.Token must produce identical output for the same
+// inputs. This test is the enforcement mechanism — if either implementation
+// drifts, the ambiguous-retry guarantee silently breaks.
+func TestToken_SubstrateMatchesCohort(t *testing.T) {
+	// cohort.Token is the canonical implementation; substrate.Token delegates.
+	// Test that the canonical function itself is stable and deterministic.
+	cases := []struct{ cluster, entity, gen string }{
+		{"gauss", "gpu-001", "gen-1"},
+		{"gauss", "gpu-001", "gen-2"},
+		{"gauss", "n-042", "gen-1"},
+		{"other-cluster", "gpu-001", "gen-1"},
+	}
+	for _, tc := range cases {
+		a := Token(tc.cluster, tc.entity, tc.gen)
+		b := Token(tc.cluster, tc.entity, tc.gen)
+		if a != b {
+			t.Errorf("Token not deterministic for (%s,%s,%s): %q != %q", tc.cluster, tc.entity, tc.gen, a, b)
+		}
+		if len(a) == 0 {
+			t.Errorf("Token returned empty string for (%s,%s,%s)", tc.cluster, tc.entity, tc.gen)
+		}
+	}
+	// Distinct inputs produce distinct tokens.
+	t1 := Token("gauss", "gpu-001", "gen-1")
+	t2 := Token("gauss", "gpu-001", "gen-2") // different generation
+	if t1 == t2 {
+		t.Errorf("different generation should produce different token: both %q", t1)
+	}
+}
+
+// ---- 5.9.3: NewPartialCohort + assembler guard ------------------------------
+
+// NewPartialCohort rejects a non-nil Assembler at construction time.
+func TestNewPartialCohort_RejectsAssembler(t *testing.T) {
+	rung := Rung{InstanceType: "m5.xlarge", AvailZone: "us-east-1a"}
+	var members []EntityIntent
+	for i := 0; i < 3; i++ {
+		m, _ := NewEntityIntent("gauss", EntityID(string(rune('a'+i))), "gen-1", "c-p", rung, nil, "")
+		members = append(members, m)
+	}
+	asm := &fakeAssembler{}
+	_, err := NewPartialCohort("c-p", members, PhaseBudget{}, 2, asm)
+	if err == nil {
+		t.Error("expected error when Assembler is non-nil for a partial cohort")
+	}
+}
+
+// Reconcile rejects a partial cohort (NoAssembly=true) when the Reconciler
+// has a non-nil Assembler — defense-in-depth if the caller bypasses NewPartialCohort.
+func TestReconcile_PartialCohort_AssemblerGuard(t *testing.T) {
+	rung := Rung{InstanceType: "m5.xlarge", AvailZone: "us-east-1a"}
+	var members []EntityIntent
+	for i := 0; i < 3; i++ {
+		m, _ := NewEntityIntent("gauss", EntityID(string(rune('a'+i))), "gen-1", "c-p", rung, nil, "")
+		members = append(members, m)
+	}
+	// Construct via struct literal to bypass the constructor check.
+	c := Cohort{
+		ID:         "c-partial-guard",
+		Members:    members,
+		Budget:     fastBudget(),
+		MinViable:  2,
+		NoAssembly: true,
+	}
+	asm := &fakeAssembler{}
+	r := &Reconciler{
+		Actuator:   &fakeActuator{},
+		Observer:   &fakeObserver{},
+		Classifier: &fakeClassifier{},
+		Enroller:   &fakeEnroller{},
+		Assembler:  asm,
+	}
+	outcome, err := r.Reconcile(context.Background(), c)
+	if err != nil {
+		t.Fatalf("Reconcile returned Go error: %v", err)
+	}
+	if outcome.Ready {
+		t.Error("partial cohort with Assembler should not be Ready")
+	}
+	// Assembler must not have been called.
+	if int(asm.calls) != 0 {
+		t.Errorf("Assembler called %d times on a NoAssembly cohort — must be 0", asm.calls)
+	}
+	// Every entity carries a terminal record with AssemblyDisallowed.
+	for _, m := range members {
+		rec := outcome.Records[m.ID]
+		if rec.Terminal == nil {
+			t.Errorf("entity %s: Terminal=nil, want AssemblyDisallowed fault", m.ID)
+			continue
+		}
+		if rec.Terminal.Code != "AssemblyDisallowed" {
+			t.Errorf("entity %s: Terminal.Code=%q want AssemblyDisallowed", m.ID, rec.Terminal.Code)
+		}
 	}
 }

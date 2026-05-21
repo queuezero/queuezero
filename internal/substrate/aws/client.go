@@ -40,7 +40,7 @@ type limiterIface interface {
 }
 
 // Client is the single chokepoint to AWS EC2 for queuezero. It owns:
-//   - idempotency tokens on every mutation (via substrate.Token)
+//   - idempotency tokens on every mutation (via cohort.Token — single implementation)
 //   - rate limiting (via a *substrate.Limiter — not bypassable from outside)
 //   - fault classification (via awssdk.Classifier)
 //   - two bounded retry loops: Throttle and Ambiguous

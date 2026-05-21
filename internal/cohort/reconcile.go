@@ -301,6 +301,24 @@ func (r *Reconciler) Reconcile(ctx context.Context, c Cohort) (Outcome, error) {
 	}
 
 	// Phase 4 passed: barrier satisfied, parent context live. Run assembly.
+	// NoAssembly is set by NewPartialCohort; partial cohorts must not assemble.
+	if c.NoAssembly && r.Assembler != nil {
+		f := Fault{
+			Class:   FaultTerminal,
+			Code:    "AssemblyDisallowed",
+			Message: "partial cohort has NoAssembly=true but Reconciler has a non-nil Assembler; use NewMPICohort for assembly",
+		}
+		for _, tr := range trackers {
+			if !tr.isTerminal() {
+				tr.setTerminal(PhaseCohortBarrier, f)
+			}
+		}
+		for _, tr := range trackers {
+			outcome.Records[tr.intent.ID] = r.buildRecord(tr, c.ID)
+		}
+		outcome.Ready = false
+		return outcome, nil
+	}
 	if c.IsCollective() && r.Assembler != nil {
 		var members []Observation
 		for _, tr := range trackers {

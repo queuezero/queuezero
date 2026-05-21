@@ -22,9 +22,9 @@ type Cohort struct {
 	Members []EntityIntent
 
 	// Budget bounds each phase with its own deadline, so a failure names the
-	// phase it died in. A zero Budget fires all deadlines at t=0 — always use
-	// DefaultBudget() or an explicit budget. The constructors default a zero
-	// Budget to DefaultBudget() automatically.
+	// phase it died in. Any individually-zero field fires that phase's deadline
+	// at t=0 — always use DefaultBudget() or an explicit budget. The constructors
+	// fill every zero field from DefaultBudget() automatically (field-by-field).
 	Budget PhaseBudget
 
 	// MinViable is the minimum number of enrolled entities required to satisfy
@@ -35,6 +35,13 @@ type Cohort struct {
 	// correct default for MPI (all-or-nothing). For partial success, use
 	// NewPartialCohort with an explicit MinViable.
 	MinViable int
+
+	// NoAssembly is set by NewPartialCohort. When true, Reconcile refuses to
+	// invoke the Assembler even if one is configured on the Reconciler.
+	// Partial cohorts have undefined assembly semantics: if 8 of 10 satisfy
+	// MinViable, does assembly run over 8 or wait for 10? Rather than guess,
+	// partial cohorts explicitly prohibit the assembly phase.
+	NoAssembly bool
 }
 
 // NewSerialCohort constructs the 1-cohort: a single named entity, no real barrier,
@@ -79,13 +86,27 @@ func NewMPICohort(id CohortID, members []EntityIntent, budget PhaseBudget) (Coho
 // Use this for embarrassingly-parallel sets where partial membership is acceptable.
 // Budget defaults to DefaultBudget() if zero. MinViable must be > 0 and ≤ len(members).
 //
-// Returns an error if minViable is out of range or any member is invalid.
-func NewPartialCohort(id CohortID, members []EntityIntent, budget PhaseBudget, minViable int) (Cohort, error) {
+// Partial cohorts do NOT support an assembly phase: assembly requires all members
+// to be simultaneously live and enrolled, which is the all-or-nothing barrier of
+// NewMPICohort. If the Reconciler's Assembler is non-nil when reconciling a partial
+// cohort, Reconcile returns an error immediately. Pass asm to have this caught at
+// construction time rather than at reconcile time.
+//
+// Returns an error if:
+//   - members is empty
+//   - minViable is out of range [1, len(members)]
+//   - asm is non-nil (partial cohorts prohibit assembly)
+//   - any member has an invalid EntityIntent
+func NewPartialCohort(id CohortID, members []EntityIntent, budget PhaseBudget, minViable int, asm Assembler) (Cohort, error) {
 	if len(members) == 0 {
 		return Cohort{}, errors.New("cohort: NewPartialCohort requires at least one member")
 	}
 	if minViable <= 0 || minViable > len(members) {
 		return Cohort{}, fmt.Errorf("cohort: NewPartialCohort minViable %d out of range [1, %d]", minViable, len(members))
+	}
+	if asm != nil {
+		return Cohort{}, errors.New("cohort: NewPartialCohort does not support an assembly phase; " +
+			"assembly requires full membership — use NewMPICohort for all-or-nothing collectives")
 	}
 	for _, m := range members {
 		if err := validateIntent(m); err != nil {
@@ -93,19 +114,34 @@ func NewPartialCohort(id CohortID, members []EntityIntent, budget PhaseBudget, m
 		}
 	}
 	return Cohort{
-		ID:        id,
-		Members:   members,
-		Budget:    applyDefaultBudget(budget),
-		MinViable: minViable,
+		ID:         id,
+		Members:    members,
+		Budget:     applyDefaultBudget(budget),
+		MinViable:  minViable,
+		NoAssembly: true,
 	}, nil
 }
 
-// applyDefaultBudget returns DefaultBudget() when budget is fully zero, otherwise
-// returns budget unchanged. This prevents the silent instant-deadline trap.
+// applyDefaultBudget fills any zero field in b from DefaultBudget().
+// A zero duration for an individual phase fires that phase's deadline at t=0,
+// which is never intentional. Callers who set some fields explicitly have those
+// honored; any field left at zero is filled from the defaults.
 func applyDefaultBudget(b PhaseBudget) PhaseBudget {
-	zero := PhaseBudget{}
-	if b == zero {
-		return DefaultBudget()
+	d := DefaultBudget()
+	if b.LaunchAcked == 0 {
+		b.LaunchAcked = d.LaunchAcked
+	}
+	if b.Running == 0 {
+		b.Running = d.Running
+	}
+	if b.Enrolled == 0 {
+		b.Enrolled = d.Enrolled
+	}
+	if b.CohortBarrier == 0 {
+		b.CohortBarrier = d.CohortBarrier
+	}
+	if b.CohortAssembly == 0 {
+		b.CohortAssembly = d.CohortAssembly
 	}
 	return b
 }
