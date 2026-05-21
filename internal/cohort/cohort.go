@@ -9,6 +9,9 @@ type CohortID string
 // fast-fail together. A serial HPC job is the 1-cohort: cardinality one, a
 // trivially-satisfied barrier, and a no-op Assembler. It is the SAME logic,
 // not a special case — which is the evidence the model is the right shape.
+//
+// Construct with NewCohort or NewMPICohort rather than a struct literal when
+// MinViable semantics matter; see the zero-value note on MinViable.
 type Cohort struct {
 	ID      CohortID
 	Members []EntityIntent
@@ -17,11 +20,27 @@ type Cohort struct {
 	// phase it died in.
 	Budget PhaseBudget
 
-	// MinViable allows a cohort to be declared ready below full membership
-	// (e.g. an embarrassingly-parallel set). For an MPI cohort this MUST equal
-	// len(Members): the barrier is genuinely all-or-nothing. Defaults to full
-	// membership when zero.
+	// MinViable is the minimum number of enrolled entities required to satisfy
+	// the cohort barrier.
+	//
+	// ZERO-VALUE CONTRACT: MinViable==0 means "full membership required" —
+	// len(Members) is used. It does NOT mean "no quorum required" or "always
+	// satisfied." This is the correct default for MPI (all-or-nothing). For an
+	// embarrassingly-parallel set where partial success is acceptable, set
+	// MinViable explicitly. Use NewCohort or NewMPICohort to avoid the trap.
 	MinViable int
+}
+
+// NewCohort constructs a Cohort with explicit MinViable. Use this for
+// embarrassingly-parallel sets where partial membership is acceptable.
+func NewCohort(id CohortID, members []EntityIntent, budget PhaseBudget, minViable int) Cohort {
+	return Cohort{ID: id, Members: members, Budget: budget, MinViable: minViable}
+}
+
+// NewMPICohort constructs an all-or-nothing cohort (MinViable = len(members)).
+// Use this for MPI and any other domain where partial membership is not viable.
+func NewMPICohort(id CohortID, members []EntityIntent, budget PhaseBudget) Cohort {
+	return Cohort{ID: id, Members: members, Budget: budget, MinViable: len(members)}
 }
 
 // IsCollective reports whether this cohort has a real barrier. A 1-cohort is

@@ -39,6 +39,12 @@ type Actuator interface {
 // This is the single most provider-specific artifact in queuezero and is NOT
 // portable across clouds. Each provider supplies its own. See
 // docs/ARCHITECTURE.md §5 and §13.
+//
+// Implementations used with Reconciler MUST NOT return FaultAmbiguous.
+// FaultAmbiguous means "mutation status unknown" and must be resolved by the
+// provider layer (via idempotency-token re-issue) before classification reaches
+// the reconciler. Returning FaultAmbiguous here is a bug; Reconciler flags it
+// loudly as a Terminal fault with code "AmbiguousReachedReconciler".
 type Classifier interface {
 	Classify(err error) Fault
 }

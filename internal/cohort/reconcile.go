@@ -19,6 +19,9 @@ import (
 //
 // The Reconciler holds NO provider or domain knowledge. Everything it needs
 // arrives through the ports interfaces.
+//
+// Construct with NewReconciler rather than a struct literal; the field set
+// may grow in v0.x without notice.
 type Reconciler struct {
 	Actuator   Actuator
 	Observer   Observer
@@ -31,8 +34,25 @@ type Reconciler struct {
 	// throttling is a property of the account, not the call site.
 	Limiter RateLimiter
 
-	// Clock is injectable for deterministic tests.
+	// Clock overrides time.Now for deterministic tests. Nil uses time.Now.
+	// TEST-ONLY: do not set in production code.
 	Clock func() time.Time
+}
+
+// NewReconciler constructs a Reconciler with the required ports. Enroller and
+// Assembler may be nil: a nil Enroller trivially enrolls every entity (the
+// 1-cohort / no-domain case); a nil Assembler skips the collective assembly
+// phase. Limiter may be nil; if nil, mutations are rate-unlimited (use only in
+// tests or single-call tooling — never in production multi-cohort workloads).
+func NewReconciler(act Actuator, obs Observer, clf Classifier, enr Enroller, asm Assembler, lim RateLimiter) *Reconciler {
+	return &Reconciler{
+		Actuator:   act,
+		Observer:   obs,
+		Classifier: clf,
+		Enroller:   enr,
+		Assembler:  asm,
+		Limiter:    lim,
+	}
 }
 
 // RateLimiter is the account-shared client-side throttle. On a FaultThrottle
