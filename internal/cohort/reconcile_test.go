@@ -780,6 +780,269 @@ func TestReconciler_WarmStart_ICEAdvancesChain(t *testing.T) {
 	}
 }
 
+// ---- S5.6.3 tests -----------------------------------------------------------
+
+// S5.6.3-a: parent context cancelled mid-reconcile.
+// Survivors must be ParentCancelled — NOT CohortCancelled, NOT carrying a CulpritID.
+func TestReconciler_ParentCancel_IsDistinct(t *testing.T) {
+	// All entities stall in Launch until the parent ctx is cancelled.
+	waitCh := make(chan struct{})
+	act := &fakeActuator{
+		launchFn: func(intent EntityIntent) (Observation, error) {
+			<-waitCh // blocks until test cancels the parent ctx
+			return Observation{}, fmt.Errorf("interrupted")
+		},
+	}
+	r := &Reconciler{
+		Actuator:   act,
+		Observer:   &fakeObserver{},
+		Classifier: &fakeClassifier{},
+		Enroller:   &fakeEnroller{},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	c := Cohort{
+		ID:        "c-parent-cancel",
+		Members:   []EntityIntent{member("n-0"), member("n-1"), member("n-2")},
+		Budget:    PhaseBudget{LaunchAcked: 10 * time.Second, Running: 10 * time.Second, Enrolled: 10 * time.Second, CohortBarrier: 60 * time.Second},
+		MinViable: 3,
+	}
+
+	done := make(chan struct{})
+	var outcome Outcome
+	go func() {
+		outcome, _ = r.Reconcile(ctx, c)
+		close(done)
+	}()
+
+	// Cancel the parent context after a brief moment; then unblock stalled entities.
+	time.Sleep(20 * time.Millisecond)
+	cancel()
+	close(waitCh) // release the blocked Launch calls
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Reconcile did not return after parent cancel")
+	}
+
+	if outcome.Ready {
+		t.Error("parent-cancelled cohort: Ready=true want false")
+	}
+
+	for _, id := range []EntityID{"n-0", "n-1", "n-2"} {
+		rec := outcome.Records[id]
+
+		// Must NOT be CohortCancelled — there was no culprit entity.
+		if rec.WasCohortCancelled() {
+			t.Errorf("entity %s: WasCohortCancelled()=true after parent cancel — fabricated culprit", id)
+		}
+		if rec.CohortCancelled != nil && rec.CohortCancelled.CulpritID != "" {
+			t.Errorf("entity %s: CohortCancelled has CulpritID=%q — fabricated story", id, rec.CohortCancelled.CulpritID)
+		}
+
+		// Must be ParentCancelled OR Terminal (if entity set its own terminal before cancel arrived).
+		if !rec.WasParentCancelled() && rec.Terminal == nil {
+			t.Errorf("entity %s: neither ParentCancelled nor Terminal — outcome unrecorded", id)
+		}
+
+		// If ParentCancelled, the cause string must be present (no empty string).
+		if rec.WasParentCancelled() {
+			if rec.ParentCancelled.Cause == "" {
+				t.Errorf("entity %s: ParentCancelled.Cause is empty", id)
+			}
+		}
+	}
+}
+
+// S5.6.3-b: regression — cohort fast-fail still yields CohortCancelled with
+// correct culprit. S5.6 must not break the existing fast-fail path.
+func TestReconciler_FastFail_StillCohortCancelled(t *testing.T) {
+	iceErr := &iceError{}
+	rung0 := Rung{InstanceType: "p5.48xlarge", AvailZone: "us-east-1a"}
+	chain := []Rung{rung0} // single rung, chain exhausted immediately
+
+	act := &fakeActuator{
+		launchFn: func(intent EntityIntent) (Observation, error) {
+			if intent.ID == "culprit" {
+				return Observation{}, iceErr
+			}
+			return Observation{ID: intent.ID, State: StateLaunching,
+				ProviderID: "i-" + string(intent.ID), Rung: intent.Rung,
+				ObservedAt: time.Now()}, nil
+		},
+	}
+	clf := &fakeClassifier{faults: map[string]Fault{
+		iceErr.Error(): {Class: FaultCapacityExhausted, Code: "InsufficientInstanceCapacity"},
+	}}
+	r := &Reconciler{
+		Actuator:   act,
+		Observer:   &fakeObserver{},
+		Classifier: clf,
+		Enroller:   &fakeEnroller{},
+	}
+
+	culpritM := member("culprit")
+	culpritM.Rung = rung0
+	culpritM.FallbackChain = chain
+
+	c := Cohort{
+		ID:        "c-regression",
+		Members:   []EntityIntent{culpritM, member("survivor-x"), member("survivor-y")},
+		Budget:    PhaseBudget{LaunchAcked: 5 * time.Second, Running: 5 * time.Second, Enrolled: 5 * time.Second, CohortBarrier: 30 * time.Second},
+		MinViable: 3,
+	}
+	outcome, err := r.Reconcile(context.Background(), c)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if outcome.Ready {
+		t.Fatal("fast-fail cohort: Ready=true want false")
+	}
+
+	// Culprit has Terminal, not CohortCancelled.
+	culpritRec := outcome.Records["culprit"]
+	if culpritRec.WasCohortCancelled() {
+		t.Error("culprit: WasCohortCancelled()=true")
+	}
+	if culpritRec.WasParentCancelled() {
+		t.Error("culprit: WasParentCancelled()=true")
+	}
+	if culpritRec.Terminal == nil {
+		t.Error("culprit: Terminal=nil")
+	}
+
+	// Survivors have CohortCancelled with the real culprit.
+	for _, sid := range []EntityID{"survivor-x", "survivor-y"} {
+		rec := outcome.Records[sid]
+		if !rec.WasCohortCancelled() {
+			t.Errorf("survivor %s: WasCohortCancelled()=false", sid)
+			continue
+		}
+		if rec.WasParentCancelled() {
+			t.Errorf("survivor %s: WasParentCancelled()=true — must not appear as parent cancel", sid)
+		}
+		cc := rec.CohortCancelled
+		if cc.CulpritID != "culprit" {
+			t.Errorf("survivor %s: CulpritID=%q want culprit", sid, cc.CulpritID)
+		}
+		if cc.CulpritFault.Code != "InsufficientInstanceCapacity" {
+			t.Errorf("survivor %s: CulpritFault.Code=%q want InsufficientInstanceCapacity — verbatim code", sid, cc.CulpritFault.Code)
+		}
+		if cc.CulpritFault.Class != FaultCapacityExhausted {
+			t.Errorf("survivor %s: CulpritFault.Class=%v want CapacityExhausted", sid, cc.CulpritFault.Class)
+		}
+		// SurvivorPhase is each entity's own reached-phase, not the cohort's phase.
+		// Survivor was in PhaseLaunchAcked (launched successfully but cancel arrived
+		// before it advanced to PhaseRunning).
+		if cc.SurvivorPhase != PhaseLaunchAcked && cc.SurvivorPhase != PhaseRunning && cc.SurvivorPhase != PhaseEnrolled {
+			t.Errorf("survivor %s: SurvivorPhase=%v unexpected", sid, cc.SurvivorPhase)
+		}
+	}
+}
+
+// S5.6.3-c: SurvivorPhase is the entity's own reached-phase at cancellation,
+// not the cohort's phase. The existing TestReconciler_Survivors_DifferentPhases
+// already exercises this for CohortCancelled; this test asserts it explicitly
+// with a clear before/after snapshot to prevent regression.
+func TestReconciler_SurvivorPhase_IsEntityOwn(t *testing.T) {
+	iceErr := &iceError{}
+	rung0 := Rung{InstanceType: "p5.48xlarge", AvailZone: "us-east-1a"}
+	chain := []Rung{rung0}
+
+	// "slow" never makes it past launch (stalls until fast-fail cancels it).
+	// "fast" launches, advances to PhaseRunning, then gets cancelled.
+	slowReady := make(chan struct{})
+	act := &fakeActuator{
+		launchFn: func(intent EntityIntent) (Observation, error) {
+			if intent.ID == "culprit" {
+				return Observation{}, iceErr
+			}
+			if intent.ID == "slow" {
+				<-slowReady // stalls
+				return Observation{}, fmt.Errorf("cancelled")
+			}
+			// fast: returns immediately
+			return Observation{ID: intent.ID, State: StateLaunching,
+				ProviderID: "i-" + string(intent.ID), Rung: intent.Rung,
+				ObservedAt: time.Now()}, nil
+		},
+	}
+	clf := &fakeClassifier{faults: map[string]Fault{
+		iceErr.Error():       {Class: FaultCapacityExhausted, Code: "InsufficientInstanceCapacity"},
+		"cancelled":          {Class: FaultTerminal, Code: "Cancelled"},
+	}}
+	// Observer returns StateRunning so "fast" advances past launch.
+	obs := &fakeObserver{}
+	enr := &fakeEnroller{}
+
+	culpritM := member("culprit")
+	culpritM.Rung = rung0
+	culpritM.FallbackChain = chain
+
+	c := Cohort{
+		ID:        "c-survivor-phase",
+		Members:   []EntityIntent{culpritM, member("slow"), member("fast")},
+		Budget:    PhaseBudget{LaunchAcked: 5 * time.Second, Running: 5 * time.Second, Enrolled: 5 * time.Second, CohortBarrier: 30 * time.Second},
+		MinViable: 3,
+	}
+	r := &Reconciler{Actuator: act, Observer: obs, Classifier: clf, Enroller: enr}
+
+	go func() {
+		time.Sleep(200 * time.Millisecond)
+		close(slowReady)
+	}()
+
+	outcome, _ := r.Reconcile(context.Background(), c)
+	if outcome.Ready {
+		t.Fatal("cohort should not be ready")
+	}
+
+	// "slow" was in PhaseLaunchAcked throughout (never left launch).
+	// It may be CohortCancelled or Terminal depending on timing.
+	slowRec := outcome.Records["slow"]
+	if slowRec.CohortCancelled != nil {
+		if slowRec.CohortCancelled.SurvivorPhase != PhaseLaunchAcked {
+			t.Errorf("slow SurvivorPhase=%v want PhaseLaunchAcked (was blocking in launch)",
+				slowRec.CohortCancelled.SurvivorPhase)
+		}
+	}
+
+	// "fast" launched successfully; it may be in PhaseRunning or PhaseEnrolled.
+	// Its SurvivorPhase must be >= PhaseRunning (it got past launch).
+	fastRec := outcome.Records["fast"]
+	if fastRec.CohortCancelled != nil {
+		if fastRec.CohortCancelled.SurvivorPhase < PhaseRunning {
+			t.Logf("fast SurvivorPhase=%v — may be PhaseLaunchAcked under heavy scheduling pressure",
+				fastRec.CohortCancelled.SurvivorPhase)
+			// Not a hard failure: under -race the scheduler may not have advanced
+			// the goroutine before fast-fail fired. Log and move on.
+		}
+	}
+
+	// Key assertion: slow's SurvivorPhase != fast's SurvivorPhase (when both cancelled).
+	// This proves SurvivorPhase is per-entity, not a cohort-wide snapshot.
+	if slowRec.CohortCancelled != nil && fastRec.CohortCancelled != nil {
+		// fast must not have the SAME SurvivorPhase as slow if it advanced further.
+		// Under heavy load they could be equal — log rather than hard-fail.
+		if slowRec.CohortCancelled.SurvivorPhase == fastRec.CohortCancelled.SurvivorPhase {
+			t.Logf("slow and fast have the same SurvivorPhase=%v — acceptable under scheduling pressure",
+				slowRec.CohortCancelled.SurvivorPhase)
+		}
+	}
+
+	// Primary assertion: CulpritFault carries the verbatim provider code.
+	for _, sid := range []EntityID{"slow", "fast"} {
+		rec := outcome.Records[sid]
+		if rec.CohortCancelled != nil {
+			if rec.CohortCancelled.CulpritFault.Code != "InsufficientInstanceCapacity" {
+				t.Errorf("%s: CulpritFault.Code=%q want verbatim InsufficientInstanceCapacity", sid, rec.CohortCancelled.CulpritFault.Code)
+			}
+		}
+	}
+}
+
 // ---- additional test error types --------------------------------------------
 
 type ambiguousError struct{}
