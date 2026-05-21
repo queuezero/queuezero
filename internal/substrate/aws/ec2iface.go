@@ -15,4 +15,5 @@ type EC2API interface {
 	StopInstances(ctx context.Context, in *ec2.StopInstancesInput, opts ...func(*ec2.Options)) (*ec2.StopInstancesOutput, error)
 	TerminateInstances(ctx context.Context, in *ec2.TerminateInstancesInput, opts ...func(*ec2.Options)) (*ec2.TerminateInstancesOutput, error)
 	DescribeInstances(ctx context.Context, in *ec2.DescribeInstancesInput, opts ...func(*ec2.Options)) (*ec2.DescribeInstancesOutput, error)
+	DescribeTags(ctx context.Context, in *ec2.DescribeTagsInput, opts ...func(*ec2.Options)) (*ec2.DescribeTagsOutput, error)
 }

@@ -86,6 +86,10 @@ func (f *fakeEC2) DescribeInstances(_ context.Context, _ *ec2.DescribeInstancesI
 	}, nil
 }
 
+func (f *fakeEC2) DescribeTags(_ context.Context, _ *ec2.DescribeTagsInput, _ ...func(*ec2.Options)) (*ec2.DescribeTagsOutput, error) {
+	return &ec2.DescribeTagsOutput{}, nil
+}
+
 // ---- helpers ----------------------------------------------------------------
 
 // transportErr creates a net.Error for testing Ambiguous classification.

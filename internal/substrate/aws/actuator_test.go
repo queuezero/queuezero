@@ -26,6 +26,9 @@ type fakeSubstrateClient struct {
 
 	describeInstances []substrate.Instance
 	describeErr       error
+
+	// tagsByID is returned by DescribeTagsByID keyed by providerID.
+	tagsByID map[string]map[string]string
 }
 
 func (f *fakeSubstrateClient) RunInstance(_ context.Context, req substrate.RunRequest) (substrate.Instance, error) {
@@ -63,6 +66,15 @@ func (f *fakeSubstrateClient) DescribeByTag(_ context.Context, _ map[string]stri
 		return nil, f.describeErr
 	}
 	return f.describeInstances, nil
+}
+
+func (f *fakeSubstrateClient) DescribeTagsByID(_ context.Context, providerID string) (map[string]string, error) {
+	if f.tagsByID != nil {
+		if tags, ok := f.tagsByID[providerID]; ok {
+			return tags, nil
+		}
+	}
+	return map[string]string{}, nil
 }
 
 // ---- helpers ----------------------------------------------------------------
@@ -236,6 +248,58 @@ func TestObserver_ReadReadiness_TagsPresent(t *testing.T) {
 	// This is the "spored not yet written" path — must not be a hard failure.
 	if r.Enrolled {
 		t.Errorf("empty tags: Enrolled should be false")
+	}
+}
+
+// Observer hybrid enrolled path: spored writes q0:ready=true + q0:phase=enrolled
+// → Readiness.OK() == true (mount healthy + enrolled).
+func TestObserver_ReadReadiness_Enrolled(t *testing.T) {
+	const providerID = "i-enrolled"
+	fake := &fakeSubstrateClient{
+		describeInstances: []substrate.Instance{{ProviderID: providerID, State: "running"}},
+		tagsByID: map[string]map[string]string{
+			providerID: {
+				tagReady:  "true",
+				tagPhase:  "enrolled",
+				tagDetail: "slurmd up, mounts ok",
+			},
+		},
+	}
+	o := newObserverWithFake(fake)
+	r, err := o.ReadReadiness(context.Background(), "gpu-013")
+	if err != nil {
+		t.Fatalf("ReadReadiness enrolled: %v", err)
+	}
+	if !r.Enrolled {
+		t.Errorf("enrolled path: Enrolled=false want true")
+	}
+	if !r.MountHealthy {
+		t.Errorf("enrolled path: MountHealthy=false want true")
+	}
+	if !r.OK() {
+		t.Errorf("enrolled path: OK()=false want true")
+	}
+	if r.Detail != "slurmd up, mounts ok" {
+		t.Errorf("enrolled path: Detail=%q", r.Detail)
+	}
+}
+
+// Observer: q0:ready=false with q0:phase=enrolled → not enrolled (mounts unconfirmed).
+func TestObserver_ReadReadiness_ReadyFalse(t *testing.T) {
+	const providerID = "i-notready"
+	fake := &fakeSubstrateClient{
+		describeInstances: []substrate.Instance{{ProviderID: providerID, State: "running"}},
+		tagsByID: map[string]map[string]string{
+			providerID: {tagReady: "false", tagPhase: "running"},
+		},
+	}
+	o := newObserverWithFake(fake)
+	r, err := o.ReadReadiness(context.Background(), "gpu-014")
+	if err != nil {
+		t.Fatalf("ReadReadiness: %v", err)
+	}
+	if r.OK() {
+		t.Error("ready=false: OK() should be false")
 	}
 }
 

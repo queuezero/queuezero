@@ -56,6 +56,7 @@ type substrateClient interface {
 	StopInstance(ctx context.Context, id string, hibernate bool) error
 	TerminateInstance(ctx context.Context, id string) error
 	DescribeByTag(ctx context.Context, tags map[string]string) ([]substrate.Instance, error)
+	DescribeTagsByID(ctx context.Context, providerID string) (map[string]string, error)
 }
 
 // Actuator implements cohort.Actuator over substrate.Client. Every call
@@ -258,18 +259,10 @@ func (o *Observer) ReadReadiness(ctx context.Context, id cohort.EntityID) (cohor
 	}, nil
 }
 
-// readInstanceTags fetches all tags for a provider instance ID.
+// readInstanceTags fetches all tags for a provider instance ID via DescribeTags.
 // Returns a map of tag key → value; empty map on any error (advisory).
 func (o *Observer) readInstanceTags(ctx context.Context, providerID string) (map[string]string, error) {
-	instances, err := o.client.DescribeByTag(ctx, map[string]string{})
-	_ = instances
-	// TODO(step-4): use DescribeTags or pass the providerID as a filter.
-	// For now stub: return an empty map so ReadReadiness gracefully reports not-ready.
-	// This is replaced in the next iteration when we add DescribeTags to EC2API.
-	if err != nil {
-		return map[string]string{}, nil
-	}
-	return map[string]string{}, nil
+	return o.client.DescribeTagsByID(ctx, providerID)
 }
 
 // ---- helpers ----------------------------------------------------------------

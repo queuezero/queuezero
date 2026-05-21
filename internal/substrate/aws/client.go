@@ -8,7 +8,7 @@ import (
 
 	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
 
-	"github.com/aws/aws-sdk-go-v2/aws"
+	awssdk "github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 
 	"github.com/queuezero/queuezero/internal/cohort"
@@ -42,7 +42,7 @@ type limiterIface interface {
 // Client is the single chokepoint to AWS EC2 for queuezero. It owns:
 //   - idempotency tokens on every mutation (via substrate.Token)
 //   - rate limiting (via a *substrate.Limiter — not bypassable from outside)
-//   - fault classification (via aws.Classifier)
+//   - fault classification (via awssdk.Classifier)
 //   - two bounded retry loops: Throttle and Ambiguous
 //
 // What it surfaces to callers: success, FaultRetryableConsistency,
@@ -124,7 +124,7 @@ func (c *Client) StartInstance(ctx context.Context, id string) (substrate.Instan
 	}
 	change := result.StartingInstances[0]
 	return substrate.Instance{
-		ProviderID: aws.ToString(change.InstanceId),
+		ProviderID: awssdk.ToString(change.InstanceId),
 		State:      string(change.CurrentState.Name),
 	}, nil
 }
@@ -133,7 +133,7 @@ func (c *Client) StartInstance(ctx context.Context, id string) (substrate.Instan
 func (c *Client) StopInstance(ctx context.Context, id string, hibernate bool) error {
 	input := &ec2.StopInstancesInput{
 		InstanceIds: []string{id},
-		Hibernate:   aws.Bool(hibernate),
+		Hibernate:   awssdk.Bool(hibernate),
 	}
 	return c.callWithRetry(ctx, func(ctx context.Context) error {
 		if err := c.limiter.Acquire(ctx); err != nil {
@@ -157,6 +157,29 @@ func (c *Client) TerminateInstance(ctx context.Context, id string) error {
 	})
 }
 
+// DescribeTagsByID returns all tags on a specific instance as a map.
+// Used by the Observer to read spored-written readiness tags (phase 3).
+// Results are advisory; errors return an empty map, not a failure.
+func (c *Client) DescribeTagsByID(ctx context.Context, providerID string) (map[string]string, error) {
+	if err := c.limiter.Acquire(ctx); err != nil {
+		return nil, err
+	}
+	out, err := c.ec2.DescribeTags(ctx, &ec2.DescribeTagsInput{
+		Filters: []ec2types.Filter{
+			{Name: awssdk.String("resource-id"), Values: []string{providerID}},
+			{Name: awssdk.String("resource-type"), Values: []string{"instance"}},
+		},
+	})
+	if err != nil {
+		return map[string]string{}, nil // advisory
+	}
+	result := make(map[string]string, len(out.Tags))
+	for _, t := range out.Tags {
+		result[awssdk.ToString(t.Key)] = awssdk.ToString(t.Value)
+	}
+	return result, nil
+}
+
 // DescribeByTag returns instances matching all provided tag key=value pairs.
 // Results are ADVISORY and eventually consistent (B5): a miss on a freshly
 // launched instance is StateUnknown, not StateAbsent. The idempotency token
@@ -166,7 +189,7 @@ func (c *Client) DescribeByTag(ctx context.Context, tags map[string]string) ([]s
 	for k, v := range tags {
 		k, v := k, v
 		filters = append(filters, ec2types.Filter{
-			Name:   aws.String("tag:" + k),
+			Name:   awssdk.String("tag:" + k),
 			Values: []string{v},
 		})
 	}
@@ -268,11 +291,11 @@ func faultErr(f cohort.Fault) error { return &FaultError{Fault: f} }
 // EC2-specific RunInstancesInput. One-to-one; no count, no pool.
 func runRequestToEC2(req substrate.RunRequest) *ec2.RunInstancesInput {
 	in := &ec2.RunInstancesInput{
-		ImageId:      aws.String(req.AMI),
+		ImageId:      awssdk.String(req.AMI),
 		InstanceType: ec2types.InstanceType(req.InstanceType),
-		MinCount:     aws.Int32(1),
-		MaxCount:     aws.Int32(1),
-		ClientToken:  aws.String(req.IdempotencyToken),
+		MinCount:     awssdk.Int32(1),
+		MaxCount:     awssdk.Int32(1),
+		ClientToken:  awssdk.String(req.IdempotencyToken),
 		TagSpecifications: []ec2types.TagSpecification{
 			{
 				ResourceType: ec2types.ResourceTypeInstance,
@@ -281,14 +304,14 @@ func runRequestToEC2(req substrate.RunRequest) *ec2.RunInstancesInput {
 		},
 	}
 	if req.SubnetID != "" {
-		in.SubnetId = aws.String(req.SubnetID)
+		in.SubnetId = awssdk.String(req.SubnetID)
 	}
 	if len(req.SecurityGroupIDs) > 0 {
 		in.SecurityGroupIds = req.SecurityGroupIDs
 	}
 	if req.IAMInstanceArn != "" {
 		in.IamInstanceProfile = &ec2types.IamInstanceProfileSpecification{
-			Arn: aws.String(req.IAMInstanceArn),
+			Arn: awssdk.String(req.IAMInstanceArn),
 		}
 	}
 	if req.Spot {
@@ -298,12 +321,12 @@ func runRequestToEC2(req substrate.RunRequest) *ec2.RunInstancesInput {
 	}
 	if req.PlacementGroup != "" {
 		in.Placement = &ec2types.Placement{
-			GroupName:        aws.String(req.PlacementGroup),
-			AvailabilityZone: aws.String(req.AvailZone),
+			GroupName:        awssdk.String(req.PlacementGroup),
+			AvailabilityZone: awssdk.String(req.AvailZone),
 		}
 	} else if req.AvailZone != "" {
 		in.Placement = &ec2types.Placement{
-			AvailabilityZone: aws.String(req.AvailZone),
+			AvailabilityZone: awssdk.String(req.AvailZone),
 		}
 	}
 	return in
@@ -312,26 +335,26 @@ func runRequestToEC2(req substrate.RunRequest) *ec2.RunInstancesInput {
 func mapToEC2Tags(m map[string]string) []ec2types.Tag {
 	tags := make([]ec2types.Tag, 0, len(m))
 	for k, v := range m {
-		tags = append(tags, ec2types.Tag{Key: aws.String(k), Value: aws.String(v)})
+		tags = append(tags, ec2types.Tag{Key: awssdk.String(k), Value: awssdk.String(v)})
 	}
 	return tags
 }
 
 func instanceFromEC2(i ec2types.Instance) substrate.Instance {
 	inst := substrate.Instance{
-		ProviderID:   aws.ToString(i.InstanceId),
+		ProviderID:   awssdk.ToString(i.InstanceId),
 		State:        string(i.State.Name),
 		InstanceType: string(i.InstanceType),
 	}
 	if i.PrivateIpAddress != nil {
-		inst.PrivateAddr = aws.ToString(i.PrivateIpAddress)
+		inst.PrivateAddr = awssdk.ToString(i.PrivateIpAddress)
 	}
 	if i.Placement != nil {
-		inst.AvailZone = aws.ToString(i.Placement.AvailabilityZone)
+		inst.AvailZone = awssdk.ToString(i.Placement.AvailabilityZone)
 	}
 	// Extract generation tag for DescribeByTag callers (B5).
 	for _, t := range i.Tags {
-		if strings.EqualFold(aws.ToString(t.Key), "q0:generation") {
+		if strings.EqualFold(awssdk.ToString(t.Key), "q0:generation") {
 			break
 		}
 	}
