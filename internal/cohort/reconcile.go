@@ -47,6 +47,7 @@ type entityTracker struct {
 	mu              sync.Mutex
 	intent          EntityIntent
 	phase           Phase
+	enrolled        bool             // true only when waitEnrolled returned success
 	attempts        []Attempt
 	terminal        *Fault           // set when this entity cannot recover
 	cohortCancelled *CohortCancelInfo // cohort fast-failed around this healthy entity
@@ -85,6 +86,18 @@ func (t *entityTracker) isTerminal() bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return t.terminal != nil
+}
+
+func (t *entityTracker) isEnrolled() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.enrolled
+}
+
+func (t *entityTracker) setEnrolled() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.enrolled = true
 }
 
 // hasFinalOutcome returns true when the entity has any resolved outcome —
@@ -183,27 +196,16 @@ func (r *Reconciler) Reconcile(ctx context.Context, c Cohort) (Outcome, error) {
 	}
 	_ = eg.Wait()
 
-	// Count survivors (non-terminal, no outcome yet) now that all goroutines returned.
-	enrolledCount := 0
-	for _, tr := range trackers {
-		if !tr.isTerminal() {
-			enrolledCount++
-		}
-	}
-	gateSatisfied := enrolledCount >= minViable
-
-	// Check if the parent context was cancelled (operator shutdown, outer deadline).
-	parentCancelled := ctx.Err() != nil
-
 	outcome := Outcome{
 		Cohort:  c.ID,
 		Records: make(map[EntityID]Record, len(trackers)),
 	}
 
-	if !gateSatisfied || parentCancelled {
-		// Drain surviving instances so nothing idles and bills.
-		// Use a background context for drain since parent may be done.
-		drainCtx := context.Background()
+	// S5.6b.1: check the parent context FIRST, before evaluating the gate and
+	// before invoking the assembler. A parent cancel means the whole reconcile
+	// is being torn down; the gate and assembly must not run on a dead context.
+	if ctx.Err() != nil {
+		cause := ctx.Err().Error()
 		var surviving []EntityID
 		for _, tr := range trackers {
 			if !tr.isTerminal() && tr.obs.ProviderID != "" {
@@ -211,14 +213,50 @@ func (r *Reconciler) Reconcile(ctx context.Context, c Cohort) (Outcome, error) {
 			}
 		}
 		if len(surviving) > 0 {
-			_ = r.Drain(drainCtx, surviving)
+			_ = r.Drain(context.Background(), surviving)
+		}
+		for _, tr := range trackers {
+			if tr.isTerminal() {
+				continue
+			}
+			// culprit.id may be set if a fast-fail AND a parent cancel raced.
+			// Parent cancel takes priority in labelling: the operator-visible cause.
+			tr.setParentCancelled(cause)
+		}
+		for _, tr := range trackers {
+			outcome.Records[tr.intent.ID] = r.buildRecord(tr, c.ID)
+		}
+		outcome.Ready = false
+		return outcome, nil
+	}
+
+	// S5.6b.2: gateSatisfied counts entities that COMPLETED ENROLLMENT — not
+	// merely non-terminal entities. A Canceled entity is non-terminal but was
+	// not enrolled (it exited a phase loop clean without completing).
+	enrolledCount := 0
+	for _, tr := range trackers {
+		if tr.isEnrolled() {
+			enrolledCount++
+		}
+	}
+	gateSatisfied := enrolledCount >= minViable
+
+	if !gateSatisfied {
+		// Drain surviving instances so nothing idles and bills.
+		var surviving []EntityID
+		for _, tr := range trackers {
+			if !tr.isTerminal() && tr.obs.ProviderID != "" {
+				surviving = append(surviving, tr.intent.ID)
+			}
+		}
+		if len(surviving) > 0 {
+			_ = r.Drain(context.Background(), surviving)
 		}
 
-		// Classify non-terminal entities:
-		// - culprit.id populated → cohort fast-failed; survivors are CohortCancelled.
-		// - culprit.id empty AND parent cancelled → ParentCancelled; no fabricated culprit.
-		// - culprit.id empty AND gate satisfied → this branch should not be reached
-		//   without parentCancelled; guard defensively.
+		// Classify non-terminal entities by recorded fact:
+		// culprit.id set → CohortCancelled; empty → unreachable here (parent
+		// cancel was handled above and is the only way culprit.id stays empty
+		// while gate fails — defensive fallback to ParentCancelled just in case).
 		for _, tr := range trackers {
 			if tr.isTerminal() {
 				continue
@@ -229,13 +267,9 @@ func (r *Reconciler) Reconcile(ctx context.Context, c Cohort) (Outcome, error) {
 					CulpritFault: culprit.fault,
 					CulpritPhase: culprit.phase,
 					At:           culprit.at,
-				}) // SurvivorPhase set from tr.phase inside setCohortCancelled
+				})
 			} else {
-				cause := "context canceled"
-				if ctx.Err() != nil {
-					cause = ctx.Err().Error()
-				}
-				tr.setParentCancelled(cause)
+				tr.setParentCancelled("context canceled")
 			}
 		}
 
@@ -246,11 +280,11 @@ func (r *Reconciler) Reconcile(ctx context.Context, c Cohort) (Outcome, error) {
 		return outcome, nil
 	}
 
-	// Phase 4 passed: barrier satisfied. Run assembly if collective.
+	// Phase 4 passed: barrier satisfied, parent context live. Run assembly.
 	if c.IsCollective() && r.Assembler != nil {
 		var members []Observation
 		for _, tr := range trackers {
-			if !tr.isTerminal() {
+			if tr.isEnrolled() {
 				tr.mu.Lock()
 				obs := tr.obs
 				tr.mu.Unlock()
@@ -326,6 +360,11 @@ func (r *Reconciler) reconcileEntity(ctx context.Context, tr *entityTracker, bud
 	defer cancel3()
 
 	r.waitEnrolled(phase3Ctx, tr)
+	// Mark enrolled only when waitEnrolled returned without setting terminal.
+	// A cancelled or deadline entity is non-terminal but NOT enrolled.
+	if !tr.isTerminal() {
+		tr.setEnrolled()
+	}
 }
 
 // doLaunch issues Launch (or Start if PreferWarm) for one entity,

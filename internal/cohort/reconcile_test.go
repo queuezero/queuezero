@@ -1043,6 +1043,163 @@ func TestReconciler_SurvivorPhase_IsEntityOwn(t *testing.T) {
 	}
 }
 
+// ---- S5.6b tests ------------------------------------------------------------
+
+// S5.6b.3: parent cancel with enough entities non-terminal that a naive gate
+// WOULD pass. Assembler must NOT be called. Outcome must be ParentCancelled.
+// This is the behavioral proof the assembly-on-dead-context bug is closed.
+func TestReconciler_ParentCancel_AssemblerNotCalled(t *testing.T) {
+	asm := &fakeAssembler{}
+
+	// All three entities succeed immediately and reach enrollment.
+	// Then the parent ctx is cancelled while they stall in enrolled polling.
+	enrollCh := make(chan struct{})
+	enr := &fakeEnroller{
+		enrolledFn: func(id EntityID) Readiness {
+			// Block in the Enroller — simulates entities that launched and are
+			// running but haven't completed enrollment yet when parent cancels.
+			select {
+			case <-enrollCh:
+				return Readiness{Enrolled: true, MountHealthy: true}
+			case <-time.After(10 * time.Second):
+				return Readiness{}
+			}
+		},
+	}
+
+	r := &Reconciler{
+		Actuator:   &fakeActuator{},
+		Observer:   &fakeObserver{},
+		Classifier: &fakeClassifier{},
+		Enroller:   enr,
+		Assembler:  asm,
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	c := Cohort{
+		ID:        "c-parent-no-assemble",
+		Members:   []EntityIntent{member("n-0"), member("n-1"), member("n-2")},
+		Budget:    PhaseBudget{LaunchAcked: 5 * time.Second, Running: 5 * time.Second, Enrolled: 10 * time.Second, CohortBarrier: 60 * time.Second, CohortAssembly: 10 * time.Second},
+		MinViable: 3,
+	}
+
+	done := make(chan struct{})
+	var outcome Outcome
+	go func() {
+		outcome, _ = r.Reconcile(ctx, c)
+		close(done)
+	}()
+
+	// Wait briefly for entities to get into the enrollment polling loop,
+	// then cancel the parent context.
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+	close(enrollCh) // unblock the Enroller so goroutines can exit
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Reconcile did not return after parent cancel")
+	}
+
+	// S5.6b.3 primary assertion: assembler call count is ZERO.
+	assembleCalls := int(asm.calls)
+	t.Logf("Assembler call count (S5.6b.3): %d (must be 0)", assembleCalls)
+	if assembleCalls != 0 {
+		t.Errorf("Assembler was called %d times on a parent-cancelled reconcile — assembly-on-dead-context bug", assembleCalls)
+	}
+
+	if outcome.Ready {
+		t.Error("parent-cancelled cohort: Ready=true want false")
+	}
+
+	// Every entity must be ParentCancelled (not CohortCancelled, not Terminal).
+	for _, id := range []EntityID{"n-0", "n-1", "n-2"} {
+		rec := outcome.Records[id]
+		if rec.WasCohortCancelled() {
+			t.Errorf("entity %s: WasCohortCancelled()=true — fabricated culprit after parent cancel", id)
+		}
+		if !rec.WasParentCancelled() && rec.Terminal == nil {
+			t.Errorf("entity %s: neither ParentCancelled nor Terminal", id)
+		}
+	}
+}
+
+// S5.6b.4-a regression: normal collective success still invokes assembler exactly once.
+func TestReconciler_NormalCollective_AssemblerCalledOnce(t *testing.T) {
+	asm := &fakeAssembler{}
+	r := newReconciler(&fakeActuator{}, &fakeObserver{}, &fakeEnroller{}, asm)
+
+	c := Cohort{
+		ID:        "c-normal-asm",
+		Members:   []EntityIntent{member("n-0"), member("n-1"), member("n-2")},
+		Budget:    fastBudget(),
+		MinViable: 3,
+	}
+	outcome, err := r.Reconcile(context.Background(), c)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if !outcome.Ready {
+		t.Errorf("normal collective: Ready=false")
+	}
+	if int(asm.calls) != 1 {
+		t.Errorf("Assembler called %d times want 1", asm.calls)
+	}
+}
+
+// S5.6b.4-b regression: cohort fast-fail (ICE) does NOT invoke assembler.
+func TestReconciler_FastFail_AssemblerNotCalled(t *testing.T) {
+	asm := &fakeAssembler{}
+	iceErr := &iceError{}
+	rung0 := Rung{InstanceType: "p5.48xlarge", AvailZone: "us-east-1a"}
+	chain := []Rung{rung0}
+
+	act := &fakeActuator{
+		launchFn: func(intent EntityIntent) (Observation, error) {
+			if intent.ID == "culprit" {
+				return Observation{}, iceErr
+			}
+			return Observation{ID: intent.ID, State: StateLaunching,
+				ProviderID: "i-" + string(intent.ID), Rung: intent.Rung,
+				ObservedAt: time.Now()}, nil
+		},
+	}
+	clf := &fakeClassifier{faults: map[string]Fault{
+		iceErr.Error(): {Class: FaultCapacityExhausted, Code: "InsufficientInstanceCapacity"},
+	}}
+
+	culpritM := member("culprit")
+	culpritM.Rung = rung0
+	culpritM.FallbackChain = chain
+
+	r := &Reconciler{
+		Actuator:   act,
+		Observer:   &fakeObserver{},
+		Classifier: clf,
+		Enroller:   &fakeEnroller{},
+		Assembler:  asm,
+	}
+
+	c := Cohort{
+		ID:        "c-ff-no-asm",
+		Members:   []EntityIntent{culpritM, member("s-0"), member("s-1")},
+		Budget:    fastBudget(),
+		MinViable: 3,
+	}
+	outcome, err := r.Reconcile(context.Background(), c)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if outcome.Ready {
+		t.Error("fast-fail cohort: Ready=true")
+	}
+	if int(asm.calls) != 0 {
+		t.Errorf("Assembler called %d times want 0 on fast-fail cohort", asm.calls)
+	}
+}
+
 // ---- additional test error types --------------------------------------------
 
 type ambiguousError struct{}
