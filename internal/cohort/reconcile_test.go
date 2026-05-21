@@ -88,7 +88,7 @@ func (e *fakeEnroller) IsEnrolled(_ context.Context, id EntityID) (Readiness, er
 	if e.enrolledFn != nil {
 		return e.enrolledFn(id), nil
 	}
-	return Readiness{Enrolled: true, MountHealthy: true}, nil
+	return Readiness{Enrolled: true, Operational: true}, nil
 }
 
 // fakeAssembler counts invocations and records members.
@@ -316,7 +316,7 @@ func TestReconciler_PhaseAttribution(t *testing.T) {
 		Classifier: &fakeClassifier{},
 		Enroller: &fakeEnroller{
 			enrolledFn: func(id EntityID) Readiness {
-				return Readiness{Enrolled: false, MountHealthy: false}
+				return Readiness{Enrolled: false, Operational: false}
 			},
 		},
 	}
@@ -1060,7 +1060,7 @@ func TestReconciler_ParentCancel_AssemblerNotCalled(t *testing.T) {
 			// running but haven't completed enrollment yet when parent cancels.
 			select {
 			case <-enrollCh:
-				return Readiness{Enrolled: true, MountHealthy: true}
+				return Readiness{Enrolled: true, Operational: true}
 			case <-time.After(10 * time.Second):
 				return Readiness{}
 			}

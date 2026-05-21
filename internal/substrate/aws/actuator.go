@@ -254,7 +254,7 @@ func (o *Observer) ReadReadiness(ctx context.Context, id cohort.EntityID) (cohor
 
 	return cohort.Readiness{
 		Enrolled:     ready && mountHealthy,
-		MountHealthy: mountHealthy,
+		Operational: mountHealthy,
 		Detail:       detail,
 	}, nil
 }

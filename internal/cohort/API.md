@@ -4,6 +4,8 @@
 movable in coordinated multi-repo commits. v1.0 is earned by the co-proof
 (§7), not declared here.
 
+**Step 5.8 updates:** OQ-1..5 resolved (see §Open Questions at end).
+
 ---
 
 ## 1. Exported vs internal — keep/unexport verdicts
@@ -26,7 +28,9 @@ MPI transplant or queuezero's Slurm domain, once cohort is its own module.
 | `Enroller` | ports.go | Domain seam — implemented per domain |
 | `Assembler` | ports.go | Domain seam — implemented per domain |
 | `Cohort` | cohort.go | Caller-constructed input to Reconcile |
-| `NewCohort` / `NewMPICohort` | cohort.go | Constructors added this commit (see §3) |
+| `NewSerialCohort` / `NewMPICohort` / `NewPartialCohort` | cohort.go | Validating constructors (Step 5.8); default zero Budget to DefaultBudget() |
+| `NewEntityIntent` | entity.go | Validates ID, Rung, chain; auto-generates deterministic token |
+| `Token` | token.go | Deterministic idempotency-key derivation; provider-agnostic |
 | `CohortID` | cohort.go | Used in Cohort and in Record; consumers match cohorts by ID |
 | `PhaseBudget` / `DefaultBudget` | cohort.go | Caller-set per partition |
 | `Outcome` | cohort.go | Returned by Reconcile |
@@ -114,12 +118,11 @@ idempotency tokens to resolve ambiguity before classification reaches here."
 ```go
 IsEnrolled(ctx, EntityID) (Readiness, error)
 ```
-**ALMOST PASS.** `Readiness.MountHealthy` is the one vocabulary smell. "Mount" is
-HPC/filesystem language — a Globus DTN domain has no concept of a "mount" and
-would always return `MountHealthy: true`. The field's purpose is really "the
-entity is fully operational, not just process-alive." A more neutral name would be
-`Operational` or `FullyReady` — "healthy" is generic enough.
-**Action: record as open question; not renamed in this commit (breaking change).**
+**PASS (resolved in Step 5.8).** `Readiness.MountHealthy` was renamed to
+`Readiness.Operational`. The concept is unchanged — "fully functional, not merely
+running" — but the name now generalizes off HPC vocabulary. What "operational"
+means is domain-defined: Slurm checks mounts, MPI checks EFA health, Globus checks
+endpoint health. cohort defines only the slot, not the content.
 
 ### Assembler
 ```go
@@ -138,12 +141,12 @@ needs and returns only pass/fail; the reconciler never inspects topology.
 
 | Field | Zero-value trap? | Notes |
 |---|---|---|
-| `ID` | Empty string silently creates an entity with no name. **Flag.** | Validate non-empty in `NewReconciler` or document that empty ID is caller's responsibility. Open question. |
+| `ID` | ~~Empty string silently creates an entity with no name.~~ **Resolved (OQ-2): `NewEntityIntent` rejects empty ID.** | |
 | `Generation` | Empty string is valid (e.g. bootstrap generation). Fine. | |
 | `Cohort` | Must match the parent Cohort.ID. Not validated. | Low risk; mismatch surfaces in Record, not silently wrong. |
-| `Rung` | Zero-value Rung (empty strings) would pass an empty InstanceType to Launch. **Flag.** | Open question: validate in Reconcile? |
+| `Rung` | ~~Zero-value Rung (empty strings) would pass an empty InstanceType to Launch.~~ **Resolved (OQ-4): `NewEntityIntent` and all Cohort constructors call `validateRung`.** | |
 | `FallbackChain` | Nil/empty = no fallback. This IS the documented contract. Fine. | |
-| `IdempotencyToken` | Empty token means no idempotency. **Flag.** | Substrate generates tokens; callers should not leave this empty. Document prominently or make it package-generated. Open question. |
+| `IdempotencyToken` | ~~Empty token means no idempotency.~~ **Resolved (OQ-3): `NewEntityIntent` auto-generates via `cohort.Token(cluster, entity, generation)` — deterministic SHA-256 hash. Random tokens are rejected by design; determinism is the idempotency guarantee.** | |
 
 ### Rung — caller-constructed, embedded in EntityIntent
 
@@ -158,8 +161,8 @@ means single-account mode. This is the correct default and should stay documente
 |---|---|---|
 | `ID` | Empty string allowed (1-entity workloads may not need a name). Low risk. | |
 | `Members` | Nil/empty = reconcile succeeds immediately with no work. Surprising but not harmful. | |
-| `Budget` | Zero PhaseBudget = all timeouts fire instantly. **Critical trap.** Always use `DefaultBudget()` or explicit values. | NewMPICohort and NewCohort do NOT set a default budget; callers must provide one. Consider a `NewMPICohortWithBudget` variant. Open question. |
-| `MinViable` | Zero = full membership. **Documented on field and via constructors this commit.** | This is the most important zero-value decision in the package. |
+| `Budget` | ~~Zero PhaseBudget = all timeouts fire instantly. **Critical trap.**~~ **Resolved (OQ-5): `NewSerialCohort`, `NewMPICohort`, and `NewPartialCohort` apply `DefaultBudget()` when the passed budget is fully zero.** | |
+| `MinViable` | Zero = full membership (documented). **`NewPartialCohort` requires `minViable > 0`; `NewMPICohort` sets it to `len(members)`.** | |
 
 ### Record — returned to caller, never constructed externally
 
@@ -196,28 +199,36 @@ reason) and is not a gap.
 
 ## 5. Construction — decision and implementation
 
-**Problem:** `Reconciler` was a bare exported struct. Every field is permanently
-API. A new required port (e.g. a `PolicyAdvisor` for ASBB) would be a silent
-zero-value trap.
-
-**Decision: `NewReconciler` constructor added in this commit.** Signature:
-
+**Step 5.7:** `NewReconciler` constructor added. Signature:
 ```go
 func NewReconciler(act Actuator, obs Observer, clf Classifier,
     enr Enroller, asm Assembler, lim RateLimiter) *Reconciler
 ```
+`Enroller`, `Assembler`, and `Limiter` may be nil (documented). `Clock` remains
+exported for test injection, marked `TEST-ONLY`.
 
-`Enroller`, `Assembler`, and `Limiter` may be nil (documented semantics).
-`Clock` remains an exported field for test injection; it is explicitly documented
-`TEST-ONLY`. Functional-options is not implemented now — the parameter count is
-manageable (6) and the option set is stable. Revisit if it grows beyond 8.
+**Step 5.8:** Three validating Cohort constructors added:
 
-**`NewCohort` and `NewMPICohort` added in this commit** to close the `MinViable`
-zero-value trap. `NewMPICohort` explicitly sets `MinViable = len(members)`, making
-the all-or-nothing contract visible at the call site.
+```go
+func NewSerialCohort(id CohortID, member EntityIntent, budget PhaseBudget) (Cohort, error)
+func NewMPICohort(id CohortID, members []EntityIntent, budget PhaseBudget) (Cohort, error)
+func NewPartialCohort(id CohortID, members []EntityIntent, budget PhaseBudget, minViable int) (Cohort, error)
+```
 
-**`PhaseBudget` has no constructor yet.** `DefaultBudget()` exists. Consider a
-`NewMPICohortWithBudget` convenience in a later step. Open question.
+All three apply `DefaultBudget()` when the passed budget is fully zero (OQ-5).
+`NewMPICohort` sets `MinViable = len(members)` (all-or-nothing contract visible
+at the call site). `NewPartialCohort` validates `0 < minViable ≤ len(members)`.
+
+`NewEntityIntent` added (token.go + entity.go):
+```go
+func NewEntityIntent(cluster string, id EntityID, gen Generation, cohortID CohortID,
+    rung Rung, chain []Rung, token string) (EntityIntent, error)
+```
+Validates ID non-empty, Rung.InstanceType non-empty, all FallbackChain rungs valid.
+Auto-generates a deterministic token via `cohort.Token(cluster, entity, generation)`
+when token is empty (OQ-3). `cohort.Token` is SHA-256 of the three inputs — same
+algorithm as the temporary `substrate.Token`, which substrate will retire in favor
+of this once cohort is extracted.
 
 ---
 
@@ -283,19 +294,19 @@ reusable. Concretely:
 
 ---
 
-## Open questions (not changed in this commit)
+## Open questions
 
-| # | Item | Risk | When to resolve |
-|---|---|---|---|
-| OQ-1 | `Readiness.MountHealthy` naming — HPC-specific; should be `Operational` or `FullyReady` | Low: only an Enroller implementation concern | Before v1.0 |
-| OQ-2 | `EntityIntent.ID` empty string not validated | Medium: silent wrong behavior | Before Step 6 integration test |
-| OQ-3 | `EntityIntent.IdempotencyToken` empty string silently disables idempotency | High: correctness bug in production if left empty | Before Step 6; consider package-generated tokens |
-| OQ-4 | `Rung` zero-value (empty InstanceType) not validated | Medium: would pass garbage to Actuator | Before Step 6 |
-| OQ-5 | `PhaseBudget` zero-value trap (all deadlines fire instantly) | High if a caller constructs a bare Cohort without setting Budget | Add `NewMPICohortWithBudget` convenience constructor |
-| OQ-6 | `Reconciler.Clock` exported — test-only field on a production struct | Low | Before v1.0; change to unexported + test setter |
-| OQ-7 | `Reconciler.Drain` — keep exported? | Low | Reassess after Phase 2 suspend-sweeper is wired |
-| OQ-8 | `Fault.Retryable` redundant (derivable from Class) | Low | v1.0 cleanup |
-| OQ-9 | `Classifier` interface doc should explicitly state "MUST NOT return FaultAmbiguous" | Low | Add doc comment (one-line — not in this commit for scope) |
+| # | Item | Status | Risk | When to resolve |
+|---|---|---|---|---|
+| OQ-1 | `Readiness.MountHealthy` naming — HPC-specific | **RESOLVED (Step 5.8):** renamed to `Readiness.Operational`; doc states it is domain-defined | — | — |
+| OQ-2 | `EntityIntent.ID` empty string not validated | **RESOLVED (Step 5.8):** `NewEntityIntent` rejects empty ID | — | — |
+| OQ-3 | `EntityIntent.IdempotencyToken` empty silently disables idempotency | **RESOLVED (Step 5.8):** `NewEntityIntent` generates deterministic token via `cohort.Token()`; option (a) chosen — derivation lives in cohort, provider-agnostic | — | — |
+| OQ-4 | `Rung` zero-value (empty InstanceType) not validated | **RESOLVED (Step 5.8):** `validateRung` called in `NewEntityIntent` and all Cohort constructors | — | — |
+| OQ-5 | `PhaseBudget` zero-value trap (all deadlines fire instantly) | **RESOLVED (Step 5.8):** `applyDefaultBudget` in all Cohort constructors; behavioral test asserts phases actually run | — | — |
+| OQ-6 | `Reconciler.Clock` exported — test-only field on a production struct | Open | Low | Before v1.0; change to unexported + test setter |
+| OQ-7 | `Reconciler.Drain` — keep exported? | Open | Low | Reassess after Phase 2 suspend-sweeper is wired |
+| OQ-8 | `Fault.Retryable` redundant (derivable from Class) | Open | Low | v1.0 cleanup |
+| OQ-9 | `Classifier` interface doc — "MUST NOT return FaultAmbiguous" | **RESOLVED (Step 5.7):** doc comment added to interface | — | — |
 
 ---
 

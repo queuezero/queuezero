@@ -273,8 +273,8 @@ func TestObserver_ReadReadiness_Enrolled(t *testing.T) {
 	if !r.Enrolled {
 		t.Errorf("enrolled path: Enrolled=false want true")
 	}
-	if !r.MountHealthy {
-		t.Errorf("enrolled path: MountHealthy=false want true")
+	if !r.Operational {
+		t.Errorf("enrolled path: Operational=false want true")
 	}
 	if !r.OK() {
 		t.Errorf("enrolled path: OK()=false want true")
