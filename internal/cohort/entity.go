@@ -30,11 +30,6 @@ type EntityIntent struct {
 	// it NEVER substitutes a rung outside it. Empty means single-rung (no fallback).
 	FallbackChain []Rung
 
-	// PreferWarm asks the Actuator to Start an existing Stopped/Hibernated
-	// entity for this ID before falling back to a cold Launch. Warm-start is
-	// an optimization rung, not a guarantee — it can itself ICE.
-	PreferWarm bool
-
 	// IdempotencyToken is deterministic in (cluster, ID, Generation). It
 	// collapses FaultAmbiguous into FaultRetryableConsistency and is the
 	// authority over eventually-consistent reads.
@@ -50,6 +45,11 @@ type Rung struct {
 	AvailZone     string
 	CapacityModel CapacityModel
 	AccountID     string // execution account for this rung (multi-account, §3)
+
+	// WarmStart means resume a Stopped/Hibernated entity rather than cold-launch.
+	// It is a RUNG property, not a pre-check: if warm-start ICEs, advanceRung
+	// moves to the next rung in the chain exactly like any other ICE.
+	WarmStart bool
 }
 
 type CapacityModel int

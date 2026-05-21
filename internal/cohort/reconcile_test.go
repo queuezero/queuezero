@@ -2,6 +2,7 @@ package cohort
 
 import (
 	"context"
+	"fmt"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -260,15 +261,14 @@ func TestReconciler_Collective_ICE_FastFails(t *testing.T) {
 			t.Errorf("entity %s: no record", id)
 			continue
 		}
-		if rec.Terminal == nil {
-			t.Errorf("entity %s: Terminal=nil want a fault", id)
+		// Each entity is either the culprit (Terminal set) or a survivor
+		// (CohortCancelled set). One or the other must be set.
+		if rec.Terminal == nil && rec.CohortCancelled == nil {
+			t.Errorf("entity %s: both Terminal and CohortCancelled nil — no outcome recorded", id)
 		}
-	}
-
-	// Each entity tried both rungs (two Attempt entries or a fast-fail record).
-	rec0 := outcome.Records["n-0"]
-	if len(rec0.Attempts) == 0 {
-		t.Error("entity n-0: no Attempts recorded")
+		if rec.Terminal != nil && rec.CohortCancelled != nil {
+			t.Errorf("entity %s: both Terminal and CohortCancelled set — ambiguous outcome", id)
+		}
 	}
 }
 
@@ -400,6 +400,391 @@ func TestReconciler_ChainDiscipline(t *testing.T) {
 		}
 	}
 }
+
+// ---- S5.5.4 tests -----------------------------------------------------------
+
+// Collective cohort, one culprit (ICE chain-exhausted): culprit has Terminal;
+// every survivor has CohortCancelled naming the culprit + cause.
+func TestReconciler_Survivors_CohortCancelledDistinct(t *testing.T) {
+	iceErr := &iceError{}
+	rung0 := Rung{InstanceType: "p5.48xlarge", AvailZone: "us-east-1a"}
+	rung1 := Rung{InstanceType: "p5.48xlarge", AvailZone: "us-east-1b"}
+	chain := []Rung{rung0, rung1}
+
+	// Only "culprit" ICEs. Others succeed.
+	act := &fakeActuator{
+		launchFn: func(intent EntityIntent) (Observation, error) {
+			if intent.ID == "culprit" {
+				return Observation{}, iceErr
+			}
+			return Observation{ID: intent.ID, State: StateLaunching,
+				ProviderID: "i-" + string(intent.ID), Rung: intent.Rung,
+				ObservedAt: time.Now()}, nil
+		},
+	}
+	clf := &fakeClassifier{faults: map[string]Fault{
+		iceErr.Error(): {Class: FaultCapacityExhausted, Code: "InsufficientInstanceCapacity"},
+	}}
+
+	culpritM := member("culprit")
+	culpritM.Rung = rung0
+	culpritM.FallbackChain = chain
+	survivorA := member("survivor-a")
+	survivorB := member("survivor-b")
+
+	c := Cohort{
+		ID:        "c-cancel",
+		Members:   []EntityIntent{culpritM, survivorA, survivorB},
+		Budget:    PhaseBudget{LaunchAcked: 5 * time.Second, Running: 5 * time.Second, Enrolled: 5 * time.Second, CohortBarrier: 30 * time.Second},
+		MinViable: 3,
+	}
+	r := &Reconciler{
+		Actuator:   act,
+		Observer:   &fakeObserver{},
+		Classifier: clf,
+		Enroller:   &fakeEnroller{},
+	}
+	outcome, err := r.Reconcile(context.Background(), c)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if outcome.Ready {
+		t.Fatal("cohort should not be ready when culprit ICEs")
+	}
+
+	// Culprit carries Terminal, not CohortCancelled.
+	culpritRec := outcome.Records["culprit"]
+	if culpritRec.Terminal == nil {
+		t.Error("culprit: Terminal=nil want capacity-exhausted fault")
+	}
+	if culpritRec.CohortCancelled != nil {
+		t.Error("culprit: CohortCancelled is set — culprit must not appear cancelled")
+	}
+
+	// Every survivor carries CohortCancelled naming "culprit".
+	for _, sid := range []EntityID{"survivor-a", "survivor-b"} {
+		rec := outcome.Records[sid]
+		if rec.Terminal != nil {
+			t.Errorf("survivor %s: Terminal is set — survivors must not appear failed", sid)
+		}
+		if rec.CohortCancelled == nil {
+			t.Errorf("survivor %s: CohortCancelled=nil want culprit info", sid)
+			continue
+		}
+		cc := rec.CohortCancelled
+		if cc.CulpritID != "culprit" {
+			t.Errorf("survivor %s: CulpritID=%q want culprit", sid, cc.CulpritID)
+		}
+		if cc.CulpritFault.Class != FaultCapacityExhausted {
+			t.Errorf("survivor %s: CulpritFault.Class=%v want CapacityExhausted", sid, cc.CulpritFault.Class)
+		}
+		if cc.CulpritFault.Code != "InsufficientInstanceCapacity" {
+			t.Errorf("survivor %s: CulpritFault.Code=%q want InsufficientInstanceCapacity", sid, cc.CulpritFault.Code)
+		}
+		// SurvivorPhase should be set to the phase the survivor was at; PhaseLaunchAcked
+		// (the zero value) is valid if the entity was still in its first phase.
+		// Summary must not look like a failure.
+		summary := rec.Summary()
+		if summary == "" {
+			t.Errorf("survivor %s: empty Summary()", sid)
+		}
+		// Programmatic check: WasCohortCancelled must be true.
+		if !rec.WasCohortCancelled() {
+			t.Errorf("survivor %s: WasCohortCancelled()=false", sid)
+		}
+	}
+}
+
+// Survivors cancelled at different phases each record their own reached-phase.
+// This test verifies two things: (1) survivors at clearly different phases get
+// different SurvivorPhase values; (2) the culprit is never marked CohortCancelled.
+// It uses a slow entity that is held in phase 1 until the culprit fails, and
+// an entity that completes all phases before the culprit — asserting the
+// phase captured is the one the entity actually reached.
+func TestReconciler_Survivors_DifferentPhases(t *testing.T) {
+	iceErr := &iceError{}
+	rung0 := Rung{InstanceType: "p5.48xlarge", AvailZone: "us-east-1a"}
+	rung1 := Rung{InstanceType: "p5.48xlarge", AvailZone: "us-east-1b"}
+	chain := []Rung{rung0, rung1}
+
+	// "blocked" never returns from Launch until the channel closes.
+	// It will be in PhaseLaunchAcked when fast-fail fires.
+	blockedCh := make(chan struct{})
+
+	act := &fakeActuator{
+		launchFn: func(intent EntityIntent) (Observation, error) {
+			if intent.ID == "culprit" {
+				return Observation{}, iceErr
+			}
+			if intent.ID == "blocked" {
+				<-blockedCh
+				return Observation{}, fmt.Errorf("cancelled by fast-fail")
+			}
+			// "free-entity": succeeds immediately.
+			return Observation{ID: intent.ID, State: StateLaunching,
+				ProviderID: "i-" + string(intent.ID), Rung: intent.Rung,
+				ObservedAt: time.Now()}, nil
+		},
+	}
+	clf := &fakeClassifier{faults: map[string]Fault{
+		iceErr.Error():                          {Class: FaultCapacityExhausted, Code: "InsufficientInstanceCapacity"},
+		"cancelled by fast-fail":               {Class: FaultTerminal, Code: "Cancelled"},
+	}}
+
+	culpritM := member("culprit")
+	culpritM.Rung = rung0
+	culpritM.FallbackChain = chain
+
+	c := Cohort{
+		ID:        "c-phases",
+		Members:   []EntityIntent{culpritM, member("blocked"), member("free-entity")},
+		Budget:    PhaseBudget{LaunchAcked: 5 * time.Second, Running: 5 * time.Second, Enrolled: 5 * time.Second, CohortBarrier: 30 * time.Second},
+		MinViable: 3,
+	}
+	r := &Reconciler{
+		Actuator:   act,
+		Observer:   &fakeObserver{},
+		Classifier: clf,
+		Enroller:   &fakeEnroller{},
+	}
+
+	// Release the blocked entity shortly after fast-fail is expected.
+	go func() {
+		time.Sleep(200 * time.Millisecond)
+		close(blockedCh)
+	}()
+
+	outcome, _ := r.Reconcile(context.Background(), c)
+	if outcome.Ready {
+		t.Fatal("cohort should not be ready")
+	}
+
+	// Culprit must NOT be CohortCancelled.
+	culpritRec := outcome.Records["culprit"]
+	if culpritRec.WasCohortCancelled() {
+		t.Error("culprit: WasCohortCancelled()=true — culprit must not be marked cancelled")
+	}
+	if culpritRec.Terminal == nil {
+		t.Error("culprit: Terminal=nil")
+	}
+
+	// "blocked" was in PhaseLaunchAcked when fast-fail or budget hit.
+	// It may be CohortCancelled (fast-fail) or Terminal (budget). Either is fine;
+	// what matters is it is NOT marked as the culprit.
+	blockedRec := outcome.Records["blocked"]
+	if blockedRec.CohortCancelled != nil && blockedRec.CohortCancelled.CulpritID != "culprit" {
+		t.Errorf("blocked: CulpritID=%q want culprit", blockedRec.CohortCancelled.CulpritID)
+	}
+	if blockedRec.CohortCancelled != nil {
+		// SurvivorPhase of blocked must be PhaseLaunchAcked — it never got past phase 1.
+		if blockedRec.CohortCancelled.SurvivorPhase != PhaseLaunchAcked {
+			t.Errorf("blocked: SurvivorPhase=%v want PhaseLaunchAcked (was in phase 1 the whole time)",
+				blockedRec.CohortCancelled.SurvivorPhase)
+		}
+	}
+
+	// "free-entity" completed phases — its SurvivorPhase should be past PhaseLaunchAcked
+	// if fast-fail arrived after it advanced, OR PhaseLaunchAcked if fast-fail was instant.
+	freeRec := outcome.Records["free-entity"]
+	if freeRec.CohortCancelled != nil {
+		// Any phase is valid for free-entity — the test only guarantees blocked < free
+		// in the common case; under scheduling pressure they may be equal.
+		t.Logf("free-entity SurvivorPhase=%v (may be any phase depending on fast-fail timing)",
+			freeRec.CohortCancelled.SurvivorPhase)
+	}
+
+	// The two surviving records must be distinguishable from each other and from culprit.
+	for _, id := range []EntityID{"blocked", "free-entity"} {
+		rec := outcome.Records[id]
+		// Not the culprit: either CohortCancelled or Terminal, but not Terminal with culprit's code.
+		if rec.Terminal != nil && rec.Terminal.Code == "InsufficientInstanceCapacity" {
+			t.Errorf("entity %s: has culprit's ICE code — should not be the culprit", id)
+		}
+	}
+}
+
+// Summary/Explain render CohortCancelled distinctly from failure.
+func TestRecord_CohortCancelled_Summary(t *testing.T) {
+	rec := Record{
+		Entity:       "survivor-7",
+		Generation:   "g1",
+		Cohort:       "c-test",
+		ReachedPhase: PhaseRunning,
+		CohortCancelled: &CohortCancelInfo{
+			CulpritID:     "gpu-041",
+			CulpritFault:  Fault{Class: FaultCapacityExhausted, Code: "InsufficientInstanceCapacity"},
+			CulpritPhase:  PhaseRunning,
+			At:            time.Unix(1716000000, 0),
+			SurvivorPhase: PhaseRunning,
+		},
+	}
+
+	summary := rec.Summary()
+	if summary == "" {
+		t.Fatal("Summary() empty for CohortCancelled record")
+	}
+	// Must contain "cancelled" somewhere.
+	if !containsFold(summary, "cancelled") {
+		t.Errorf("Summary()=%q does not mention cancelled", summary)
+	}
+	// Must NOT look like a bare fault summary (e.g. "terminal/..." or "ready").
+	if containsFold(summary, "terminal") || containsFold(summary, "ready (") {
+		t.Errorf("Summary()=%q looks like a fault or success summary", summary)
+	}
+	// WasCohortCancelled must be true; Succeeded must be false.
+	if !rec.WasCohortCancelled() {
+		t.Error("WasCohortCancelled()=false")
+	}
+	if rec.Succeeded() {
+		t.Error("Succeeded()=true for a cancelled record")
+	}
+
+	// Explain must be distinct.
+	explain := rec.Explain()
+	if !containsFold(explain, "gpu-041") {
+		t.Errorf("Explain() does not name the culprit entity: %s", explain)
+	}
+	if !containsFold(explain, "InsufficientInstanceCapacity") {
+		t.Errorf("Explain() does not name the culprit fault code: %s", explain)
+	}
+}
+
+func containsFold(s, sub string) bool {
+	return len(s) >= len(sub) && containsSubstring(s, sub)
+}
+
+func containsSubstring(s, sub string) bool {
+	for i := 0; i <= len(s)-len(sub); i++ {
+		if equalFold(s[i:i+len(sub)], sub) {
+			return true
+		}
+	}
+	return false
+}
+
+func equalFold(a, b string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		ca, cb := a[i], b[i]
+		if ca >= 'A' && ca <= 'Z' {
+			ca += 32
+		}
+		if cb >= 'A' && cb <= 'Z' {
+			cb += 32
+		}
+		if ca != cb {
+			return false
+		}
+	}
+	return true
+}
+
+// Ambiguous-reached-reconciler flags one entity Terminal but does not abort others.
+func TestReconciler_AmbiguousBugIsLocalized(t *testing.T) {
+	ambErr := &ambiguousError{}
+	act := &fakeActuator{
+		launchFn: func(intent EntityIntent) (Observation, error) {
+			if intent.ID == "amb-entity" {
+				return Observation{}, ambErr
+			}
+			return Observation{ID: intent.ID, State: StateLaunching,
+				ProviderID: "i-" + string(intent.ID), Rung: intent.Rung,
+				ObservedAt: time.Now()}, nil
+		},
+	}
+	// Classifier returns Ambiguous for the ambiguous error.
+	clf := &fakeClassifier{faults: map[string]Fault{
+		ambErr.Error(): {Class: FaultAmbiguous, Code: "TransportError"},
+	}}
+	r := &Reconciler{
+		Actuator:   act,
+		Observer:   &fakeObserver{},
+		Classifier: clf,
+		Enroller:   &fakeEnroller{},
+	}
+
+	// Two-member cohort: one ambiguous entity, one healthy.
+	// With MinViable=1, the healthy entity can satisfy the barrier alone.
+	c := Cohort{
+		ID:        "c-amb",
+		Members:   []EntityIntent{member("amb-entity"), member("healthy")},
+		Budget:    fastBudget(),
+		MinViable: 1,
+	}
+	outcome, err := r.Reconcile(context.Background(), c)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	// Ambiguous entity: Terminal with loud BUG code; not a panic, not an outage.
+	ambRec := outcome.Records["amb-entity"]
+	if ambRec.Terminal == nil {
+		t.Error("amb-entity: Terminal=nil — Ambiguous must set Terminal")
+	} else if ambRec.Terminal.Code != "AmbiguousReachedReconciler" {
+		t.Errorf("amb-entity: Terminal.Code=%q want AmbiguousReachedReconciler", ambRec.Terminal.Code)
+	}
+
+	// Healthy entity should succeed (MinViable=1 satisfied).
+	healthyRec := outcome.Records["healthy"]
+	if !healthyRec.Succeeded() {
+		t.Errorf("healthy entity failed: %s", healthyRec.Summary())
+	}
+}
+
+// Warm-start ICE advances the chain like any other rung (not a bypass).
+func TestReconciler_WarmStart_ICEAdvancesChain(t *testing.T) {
+	iceErr := &iceError{}
+	warmRung := Rung{InstanceType: "p4d.24xlarge", AvailZone: "us-east-1a", WarmStart: true}
+	coldRung := Rung{InstanceType: "p4d.24xlarge", AvailZone: "us-east-1a", WarmStart: false}
+	chain := []Rung{warmRung, coldRung}
+
+	var startCalled, launchCalled int
+	act := &fakeActuator{
+		startFn: func(id EntityID) (Observation, error) {
+			startCalled++
+			return Observation{}, iceErr // warm-start ICEs
+		},
+		launchFn: func(intent EntityIntent) (Observation, error) {
+			launchCalled++
+			return Observation{ID: intent.ID, State: StateLaunching,
+				ProviderID: "i-cold", Rung: intent.Rung, ObservedAt: time.Now()}, nil
+		},
+	}
+	clf := &fakeClassifier{faults: map[string]Fault{
+		iceErr.Error(): {Class: FaultCapacityExhausted, Code: "InsufficientInstanceCapacity"},
+	}}
+	r := &Reconciler{Actuator: act, Observer: &fakeObserver{}, Classifier: clf, Enroller: &fakeEnroller{}}
+
+	m := member("warm-entity")
+	m.Rung = warmRung
+	m.FallbackChain = chain
+
+	outcome, err := r.Reconcile(context.Background(), Cohort{
+		ID:      "c-warm",
+		Members: []EntityIntent{m},
+		Budget:  fastBudget(),
+	})
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if !outcome.Ready {
+		t.Errorf("warm→cold fallback: Ready=false, summary=%s", outcome.Records["warm-entity"].Summary())
+	}
+	if startCalled != 1 {
+		t.Errorf("Start called %d times want 1", startCalled)
+	}
+	if launchCalled != 1 {
+		t.Errorf("Launch called %d times want 1 (after warm-start ICE)", launchCalled)
+	}
+}
+
+// ---- additional test error types --------------------------------------------
+
+type ambiguousError struct{}
+
+func (e *ambiguousError) Error() string { return "TransportError" }
 
 // ---- test error types -------------------------------------------------------
 

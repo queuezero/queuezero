@@ -2,6 +2,7 @@ package cohort
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -43,13 +44,13 @@ type RateLimiter interface {
 
 // entityTracker holds per-entity reconciliation state.
 type entityTracker struct {
-	mu       sync.Mutex
-	intent   EntityIntent
-	rungIdx  int // current position in the fallback chain
-	phase    Phase
-	attempts []Attempt
-	terminal *Fault // set when this entity cannot recover
-	obs      Observation
+	mu        sync.Mutex
+	intent    EntityIntent
+	phase     Phase
+	attempts  []Attempt
+	terminal  *Fault // set when this entity cannot recover
+	cancelled *CohortCancelInfo // set when cohort fast-fails around this healthy entity
+	obs       Observation
 	startedAt time.Time
 }
 
@@ -85,6 +86,14 @@ func (t *entityTracker) isTerminal() bool {
 	return t.terminal != nil
 }
 
+func (t *entityTracker) setCancelled(info CohortCancelInfo) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	cp := info
+	cp.SurvivorPhase = t.phase
+	t.cancelled = &cp
+}
+
 // Reconcile drives a cohort to PhaseReady or returns an Outcome explaining,
 // per entity, exactly where and why it stopped.
 func (r *Reconciler) Reconcile(ctx context.Context, c Cohort) (Outcome, error) {
@@ -105,12 +114,15 @@ func (r *Reconciler) Reconcile(ctx context.Context, c Cohort) (Outcome, error) {
 	}
 
 	// Phase 1–3: per-entity, concurrent.
-	// fastFailCh carries the first gate-unsatisfiable signal to cancel siblings.
+	// fastFailCancel cancels all sibling goroutines the instant the gate goes
+	// unsatisfiable. culpritOnce ensures only the first failing entity records
+	// itself as culprit.
 	fastFailCtx, fastFailCancel := context.WithCancel(ctx)
 	defer fastFailCancel()
 
-	var mu sync.Mutex // protects gate check
+	var mu sync.Mutex
 	failedCount := 0
+	var culprit culpritInfo // first entity that made the gate unsatisfiable
 
 	eg, egCtx := errgroup.WithContext(fastFailCtx)
 	for _, tr := range trackers {
@@ -121,17 +133,28 @@ func (r *Reconciler) Reconcile(ctx context.Context, c Cohort) (Outcome, error) {
 				mu.Lock()
 				failedCount++
 				satisfiable := (len(trackers) - failedCount) >= minViable
+				if !satisfiable && culprit.id == "" {
+					// Capture the culprit before cancelling siblings.
+					tr.mu.Lock()
+					culprit = culpritInfo{
+						id:    tr.intent.ID,
+						fault: *tr.terminal,
+						phase: tr.phase,
+						at:    time.Now(),
+					}
+					tr.mu.Unlock()
+				}
 				mu.Unlock()
 				if !satisfiable {
-					fastFailCancel() // abort surviving siblings immediately
+					fastFailCancel()
 				}
 			}
-			return nil // errors are per-entity; never propagate to errgroup
+			return nil
 		})
 	}
 	_ = eg.Wait()
 
-	// Check whether the barrier can be satisfied.
+	// Count survivors (non-terminal) now that all goroutines have returned.
 	enrolledCount := 0
 	for _, tr := range trackers {
 		if !tr.isTerminal() {
@@ -146,7 +169,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, c Cohort) (Outcome, error) {
 	}
 
 	if !gateSatisfied {
-		// Fast-fail: drain any healthy survivors so nothing idles and bills.
+		// Drain any surviving instances so nothing idles and bills.
 		var surviving []EntityID
 		for _, tr := range trackers {
 			if !tr.isTerminal() && tr.obs.ProviderID != "" {
@@ -154,19 +177,23 @@ func (r *Reconciler) Reconcile(ctx context.Context, c Cohort) (Outcome, error) {
 			}
 		}
 		if len(surviving) > 0 {
-			_ = r.Drain(ctx, surviving) // best-effort; don't mask the capacity error
+			_ = r.Drain(ctx, surviving)
 		}
-		// Mark survivors as fast-failed in their records.
+
+		// Mark survivors with CohortCancelled — not a fault, a distinct outcome.
+		// Each survivor records the phase IT was at when cancelled.
+		cancelBase := CohortCancelInfo{
+			CulpritID:    culprit.id,
+			CulpritFault: culprit.fault,
+			CulpritPhase: culprit.phase,
+			At:           culprit.at,
+		}
 		for _, tr := range trackers {
 			if !tr.isTerminal() {
-				f := Fault{
-					Class:   FaultTerminal,
-					Code:    "CohortFastFail",
-					Message: fmt.Sprintf("cohort gate unsatisfiable: need %d enrolled, got %d", minViable, enrolledCount),
-				}
-				tr.setTerminal(PhaseCohortBarrier, f)
+				tr.setCancelled(cancelBase) // SurvivorPhase set from tr.phase inside setCancelled
 			}
 		}
+
 		for _, tr := range trackers {
 			outcome.Records[tr.intent.ID] = r.buildRecord(tr, c.ID)
 		}
@@ -218,13 +245,18 @@ func (r *Reconciler) Reconcile(ctx context.Context, c Cohort) (Outcome, error) {
 }
 
 // reconcileEntity drives one entity through phases 1–3 within budget.
-// On return, tr.terminal is set if the entity failed, or tr.phase == PhaseEnrolled.
+// ctx is egCtx (derived from fastFailCtx); phase-scoped sub-contexts add deadlines.
+// On return: tr.terminal is set if this entity failed; tr.phase reflects how far
+// it got. If ctx is cancelled by fastFailCancel (Canceled, not DeadlineExceeded),
+// the entity is left non-terminal so the caller can mark it CohortCancelled.
 func (r *Reconciler) reconcileEntity(ctx context.Context, tr *entityTracker, budget PhaseBudget) {
 	// Phase 1: launch-acked.
 	phase1Ctx, cancel1 := context.WithTimeout(ctx, budget.LaunchAcked)
 	defer cancel1()
 
 	if !r.doLaunch(phase1Ctx, tr) {
+		// If terminal was set, this is a real failure. Otherwise the entity was
+		// cancelled by fastFailCancel — leave it non-terminal.
 		return
 	}
 	tr.setPhase(PhaseRunning)
@@ -238,7 +270,7 @@ func (r *Reconciler) reconcileEntity(ctx context.Context, tr *entityTracker, bud
 	}
 	tr.setPhase(PhaseEnrolled)
 
-	// Phase 3: enrolled (domain check via Enroller).
+	// Phase 3: enrolled.
 	phase3Ctx, cancel3 := context.WithTimeout(ctx, budget.Enrolled)
 	defer cancel3()
 
@@ -252,6 +284,9 @@ func (r *Reconciler) doLaunch(ctx context.Context, tr *entityTracker) bool {
 	consistencyAttempt := 0
 	for {
 		if err := ctx.Err(); err != nil {
+			if isFastFailCancel(err) {
+				return false // leave non-terminal; caller marks CohortCancelled
+			}
 			r.recordDeadline(tr, PhaseLaunchAcked)
 			return false
 		}
@@ -259,7 +294,7 @@ func (r *Reconciler) doLaunch(ctx context.Context, tr *entityTracker) bool {
 		var obs Observation
 		var err error
 
-		if tr.intent.PreferWarm {
+		if tr.intent.Rung.WarmStart {
 			obs, err = r.Actuator.Start(ctx, tr.intent.ID)
 		} else {
 			obs, err = r.Actuator.Launch(ctx, tr.intent)
@@ -322,6 +357,9 @@ func (r *Reconciler) waitRunning(ctx context.Context, tr *entityTracker) bool {
 	consistencyAttempt := 0
 	for {
 		if err := ctx.Err(); err != nil {
+			if isFastFailCancel(err) {
+				return false
+			}
 			r.recordDeadline(tr, PhaseRunning)
 			return false
 		}
@@ -362,6 +400,9 @@ func (r *Reconciler) waitRunning(ctx context.Context, tr *entityTracker) bool {
 func (r *Reconciler) waitEnrolled(ctx context.Context, tr *entityTracker) {
 	for {
 		if err := ctx.Err(); err != nil {
+			if isFastFailCancel(err) {
+				return
+			}
 			r.recordDeadline(tr, PhaseEnrolled)
 			return
 		}
@@ -413,6 +454,14 @@ func (r *Reconciler) Drain(ctx context.Context, ids []EntityID) error {
 	return lastErr
 }
 
+// culpritInfo captures the first entity that made the cohort gate unsatisfiable.
+type culpritInfo struct {
+	id    EntityID
+	fault Fault
+	phase Phase
+	at    time.Time
+}
+
 func (r *Reconciler) recordDeadline(tr *entityTracker, phase Phase) {
 	f := Fault{
 		Class:   FaultTerminal,
@@ -426,17 +475,17 @@ func (r *Reconciler) recordDeadline(tr *entityTracker, phase Phase) {
 func (r *Reconciler) buildRecord(tr *entityTracker, cohortID CohortID) Record {
 	tr.mu.Lock()
 	defer tr.mu.Unlock()
-	rec := Record{
-		Entity:     tr.intent.ID,
-		Generation: tr.intent.Generation,
-		Cohort:     cohortID,
-		ReachedPhase: tr.phase,
-		Attempts:   append([]Attempt(nil), tr.attempts...),
-		Terminal:   tr.terminal,
-		StartedAt:  tr.startedAt,
-		FinishedAt: time.Now(),
+	return Record{
+		Entity:          tr.intent.ID,
+		Generation:      tr.intent.Generation,
+		Cohort:          cohortID,
+		ReachedPhase:    tr.phase,
+		Attempts:        append([]Attempt(nil), tr.attempts...),
+		Terminal:        tr.terminal,
+		CohortCancelled: tr.cancelled,
+		StartedAt:       tr.startedAt,
+		FinishedAt:      time.Now(),
 	}
-	return rec
 }
 
 func (r *Reconciler) clock() time.Time {
@@ -444,6 +493,15 @@ func (r *Reconciler) clock() time.Time {
 		return r.Clock()
 	}
 	return time.Now()
+}
+
+// isFastFailCancel returns true when ctx was cancelled by fastFailCancel()
+// rather than by a per-phase DeadlineExceeded. context.Canceled means a
+// sibling cancelled us; context.DeadlineExceeded means our own budget ran out.
+// The distinction matters for Record: fast-fail survivors are CohortCancelled,
+// not Terminal.
+func isFastFailCancel(err error) bool {
+	return errors.Is(err, context.Canceled)
 }
 
 // sleep sleeps for d or until ctx is done.
