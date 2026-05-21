@@ -25,6 +25,11 @@ type EntityIntent struct {
 	// FaultCapacityExhausted; it never substitutes outside the chain.
 	Rung Rung
 
+	// FallbackChain is the ordered list of approved rungs from partitions.yaml.
+	// The reconciler advances through this chain on FaultCapacityExhausted;
+	// it NEVER substitutes a rung outside it. Empty means single-rung (no fallback).
+	FallbackChain []Rung
+
 	// PreferWarm asks the Actuator to Start an existing Stopped/Hibernated
 	// entity for this ID before falling back to a cold Launch. Warm-start is
 	// an optimization rung, not a guarantee — it can itself ICE.
