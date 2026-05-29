@@ -10,6 +10,9 @@ import (
 	"os"
 
 	"github.com/spf13/cobra"
+
+	"github.com/queuezero/queuezero/internal/cohort"
+	"github.com/queuezero/queuezero/internal/recordstore"
 )
 
 var version = "0.0.0-dev"
@@ -23,6 +26,11 @@ func main() {
 			"API with fast-fail classification. No CloudFormation, no CDK, no ASG.",
 	}
 	root.Version = version
+	// A runtime error (e.g. "no record for entity") is not a usage mistake;
+	// don't dump the usage block on it. Cobra still prints usage for genuine
+	// flag/arg errors via Args validators.
+	root.SilenceUsage = true
+	root.SilenceErrors = true
 
 	root.AddCommand(
 		cmdApply(),
@@ -91,12 +99,62 @@ func cmdCapture() *cobra.Command {
 
 // cmdExplain renders the full structured failure trace for an entity: fault
 // class, verbatim provider code, the phase it died in, every rung attempted.
+// It reads the persisted cohort.Record from the record store under the cluster
+// state dir — the reconciler process is long gone (ResumeProgram is per-call),
+// so the Record must be read from durable storage, not held in memory.
+//
+// With no entity argument it lists every entity that has a stored record.
 func cmdExplain() *cobra.Command {
-	return &cobra.Command{
+	var dir string
+	c := &cobra.Command{
 		Use:   "explain [entity]",
 		Short: "show the structured reconciliation trace for an entity",
-		RunE: func(*cobra.Command, []string) error {
-			return fmt.Errorf("not yet implemented — see internal/cohort/explain.go")
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(_ *cobra.Command, args []string) error {
+			store, err := recordstore.NewFileStore(dir)
+			if err != nil {
+				return err
+			}
+
+			// No entity: list what records exist.
+			if len(args) == 0 {
+				ids, err := store.List()
+				if err != nil {
+					return err
+				}
+				if len(ids) == 0 {
+					return fmt.Errorf("no reconciliation records found under %s", dir)
+				}
+				fmt.Printf("records under %s:\n", dir)
+				for _, id := range ids {
+					rec, err := store.Get(id)
+					if err != nil {
+						fmt.Printf("  %-24s (unreadable: %v)\n", id, err)
+						continue
+					}
+					fmt.Printf("  %-24s %s\n", id, rec.Summary())
+				}
+				return nil
+			}
+
+			rec, err := store.Get(cohort.EntityID(args[0]))
+			if err != nil {
+				return err
+			}
+			fmt.Print(rec.Explain())
+			return nil
 		},
 	}
+	c.Flags().StringVar(&dir, "records-dir", defaultRecordsDir(), "directory holding persisted reconciliation records")
+	return c
+}
+
+// defaultRecordsDir is where records live absent an explicit flag. It mirrors
+// the controller state-dir convention; the real path comes from cluster.yaml's
+// ControllerSpec.StateDir once `q0 apply` wires it through.
+func defaultRecordsDir() string {
+	if d := os.Getenv("Q0_RECORDS_DIR"); d != "" {
+		return d
+	}
+	return "/var/lib/queuezero/records"
 }
