@@ -34,6 +34,12 @@ func (f *fakeS3API) PutObject(_ context.Context, in *s3.PutObjectInput, _ ...fun
 	return &s3.PutObjectOutput{}, nil
 }
 
+// HeadObject is unused by S3Publisher (manifest publishing always PUTs), but
+// required to satisfy the aws.S3API interface.
+func (f *fakeS3API) HeadObject(_ context.Context, _ *s3.HeadObjectInput, _ ...func(*s3.Options)) (*s3.HeadObjectOutput, error) {
+	return &s3.HeadObjectOutput{}, nil
+}
+
 // The Step 6 unblock proof: a collective resume now reconciles through the REAL
 // aws.S3Publisher (no longer nil), publishing a complete peer manifest. This is
 // the production path the 2a gate refused; here it runs end to end against a

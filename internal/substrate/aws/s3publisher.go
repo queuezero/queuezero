@@ -16,6 +16,9 @@ import (
 // is to write one object, so it needs nothing else.
 type S3API interface {
 	PutObject(ctx context.Context, in *s3.PutObjectInput, opts ...func(*s3.Options)) (*s3.PutObjectOutput, error)
+	// HeadObject reports whether an object exists (and its metadata). Used by the
+	// content-addressed bootstrap uploader to skip a redundant upload.
+	HeadObject(ctx context.Context, in *s3.HeadObjectInput, opts ...func(*s3.Options)) (*s3.HeadObjectOutput, error)
 }
 
 // S3Publisher implements mpi.ManifestPublisher (structurally — no mpi import

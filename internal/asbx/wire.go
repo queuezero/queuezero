@@ -37,6 +37,7 @@ const (
 	EnvGeneration    = "Q0_GENERATION"
 	EnvBootstrapS3   = "Q0_BOOTSTRAP_S3"
 	EnvManifestBucket = "Q0_MANIFEST_BUCKET"
+	EnvScriptsBucket = "Q0_SCRIPTS_BUCKET"
 	EnvInstanceProfile = "Q0_INSTANCE_PROFILE_ARN"
 	EnvPartition     = "Q0_PARTITION"
 	envSlurmResumePartition = "SLURM_RESUME_PARTITION"

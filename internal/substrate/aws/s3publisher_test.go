@@ -9,17 +9,23 @@ import (
 	"testing"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 
 	"github.com/queuezero/queuezero/internal/mpi"
 )
 
-// fakeS3 captures the last PutObject call and can inject an error.
+// fakeS3 captures the last PutObject call and can inject an error. It also
+// models HeadObject for the content-addressed uploader's skip-if-exists check.
 type fakeS3 struct {
 	putErr     error
 	lastBucket string
 	lastKey    string
 	lastBody   []byte
 	calls      int
+
+	headExists bool  // HeadObject reports the object present
+	headErr    error // a non-NotFound error to inject from HeadObject
+	headCalls  int
 }
 
 func (f *fakeS3) PutObject(_ context.Context, in *s3.PutObjectInput, _ ...func(*s3.Options)) (*s3.PutObjectOutput, error) {
@@ -37,6 +43,17 @@ func (f *fakeS3) PutObject(_ context.Context, in *s3.PutObjectInput, _ ...func(*
 		return nil, f.putErr
 	}
 	return &s3.PutObjectOutput{}, nil
+}
+
+func (f *fakeS3) HeadObject(_ context.Context, _ *s3.HeadObjectInput, _ ...func(*s3.Options)) (*s3.HeadObjectOutput, error) {
+	f.headCalls++
+	if f.headErr != nil {
+		return nil, f.headErr
+	}
+	if f.headExists {
+		return &s3.HeadObjectOutput{}, nil
+	}
+	return nil, &s3types.NotFound{}
 }
 
 // *S3Publisher must satisfy mpi.ManifestPublisher (the seam slurm.NewAssembler needs).

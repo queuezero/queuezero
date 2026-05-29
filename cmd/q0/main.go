@@ -6,16 +6,21 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"time"
 
+	awssdkconfig "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/spf13/cobra"
 
 	"github.com/queuezero/queuezero/internal/asbx"
+	"github.com/queuezero/queuezero/internal/bootstrap"
 	"github.com/queuezero/queuezero/internal/cohort"
 	"github.com/queuezero/queuezero/internal/recordstore"
 	"github.com/queuezero/queuezero/internal/slurm"
+	awssub "github.com/queuezero/queuezero/internal/substrate/aws"
 )
 
 var version = "0.0.0-dev"
@@ -42,6 +47,7 @@ func main() {
 		cmdCapture(),
 		cmdExplain(),
 		cmdSweep(),
+		cmdBootstrap(),
 	)
 
 	if err := root.Execute(); err != nil {
@@ -203,5 +209,80 @@ func cmdSweep() *cobra.Command {
 	c.Flags().DurationVar(&grace, "grace", 10*time.Minute, "minimum age before a stale-generation instance is reaped")
 	c.Flags().BoolVar(&dryRun, "dry-run", false, "report what would be reaped without terminating")
 	c.Flags().StringVar(&partition, "partition", "", "partition hint (sweep is cluster-wide; rarely needed)")
+	return c
+}
+
+// cmdBootstrap groups producer-side bootstrap commands. `push` packages a
+// script-set directory, uploads it content-addressed to S3, and prints the
+// s3:// URI to pin in Q0_BOOTSTRAP_S3 (which the launch-time userdata shim then
+// fetches + verifies + execs — ARCHITECTURE §11).
+func cmdBootstrap() *cobra.Command {
+	c := &cobra.Command{
+		Use:   "bootstrap",
+		Short: "build and publish node bootstrap script-sets",
+	}
+	c.AddCommand(cmdBootstrapPush())
+	return c
+}
+
+func cmdBootstrapPush() *cobra.Command {
+	var bucket, region string
+	var dryRun bool
+	c := &cobra.Command{
+		Use:   "push <dir>",
+		Short: "package a script-set, upload it content-addressed, print the URI to pin",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			dir := args[0]
+			if bucket == "" {
+				bucket = os.Getenv(asbx.EnvScriptsBucket)
+			}
+
+			// Package + hash in one pass (no AWS needed yet).
+			var buf bytes.Buffer
+			digest, err := bootstrap.Pack(dir, &buf)
+			if err != nil {
+				return err
+			}
+			uri := "s3://" + bucket + "/" + bootstrap.ScriptKey(digest)
+
+			if dryRun {
+				if bucket == "" {
+					uri = "s3://<bucket>/" + bootstrap.ScriptKey(digest)
+				}
+				fmt.Printf("would upload %s (%d bytes, sha256=%s)\n", uri, buf.Len(), digest)
+				return nil
+			}
+			if bucket == "" {
+				return fmt.Errorf("no scripts bucket: set --bucket or %s", asbx.EnvScriptsBucket)
+			}
+			if region == "" {
+				region = os.Getenv(asbx.EnvRegion)
+			}
+			if region == "" {
+				return fmt.Errorf("no region: set --region or %s", asbx.EnvRegion)
+			}
+
+			awsCfg, err := awssdkconfig.LoadDefaultConfig(cmd.Context(), awssdkconfig.WithRegion(region))
+			if err != nil {
+				return fmt.Errorf("load AWS config: %w", err)
+			}
+			uploader := awssub.NewBootstrapUploader(s3.NewFromConfig(awsCfg), bucket)
+			gotURI, skipped, err := uploader.PutScriptSet(cmd.Context(), digest, buf.Bytes())
+			if err != nil {
+				return err
+			}
+			note := ""
+			if skipped {
+				note = " (already present)"
+			}
+			fmt.Printf("%s%s\n", gotURI, note)
+			fmt.Printf("pin it: export %s=%s\n", asbx.EnvBootstrapS3, gotURI)
+			return nil
+		},
+	}
+	c.Flags().StringVar(&bucket, "bucket", "", "S3 bucket for script-sets (else $"+asbx.EnvScriptsBucket+")")
+	c.Flags().StringVar(&region, "region", "", "AWS region (else $"+asbx.EnvRegion+")")
+	c.Flags().BoolVar(&dryRun, "dry-run", false, "package and print the URI/digest without uploading")
 	return c
 }
