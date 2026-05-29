@@ -18,6 +18,7 @@ import (
 
 	awssdkconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 
 	"github.com/queuezero/queuezero/internal/cohort"
 	"github.com/queuezero/queuezero/internal/recordstore"
@@ -35,6 +36,7 @@ const (
 	EnvStateDir      = "Q0_STATE_DIR"
 	EnvGeneration    = "Q0_GENERATION"
 	EnvBootstrapS3   = "Q0_BOOTSTRAP_S3"
+	EnvManifestBucket = "Q0_MANIFEST_BUCKET"
 	EnvPartition     = "Q0_PARTITION"
 	envSlurmResumePartition = "SLURM_RESUME_PARTITION"
 
@@ -49,6 +51,9 @@ type Settings struct {
 	StateDir       string
 	Generation     string
 	BootstrapS3    string
+	// ManifestBucket is the S3 bucket the collective peer manifest is published
+	// to. Empty => no Assembler is wired and collective resume stays gated.
+	ManifestBucket string
 	// Partition is the partition name slurmctld is resuming/suspending, if known
 	// (from --partition or the Slurm/Q0 env). Empty => resolve by node name.
 	Partition string
@@ -72,6 +77,7 @@ func SettingsFromEnv(partitionFlag string) Settings {
 		StateDir:       stateDir,
 		Generation:     os.Getenv(EnvGeneration),
 		BootstrapS3:    os.Getenv(EnvBootstrapS3),
+		ManifestBucket: os.Getenv(EnvManifestBucket),
 		Partition:      partition,
 	}
 }
@@ -91,8 +97,10 @@ func (s Settings) Validate() error {
 }
 
 // BuildBridge constructs a production slurm.Bridge from settings. The Assembler
-// is left nil: collective resume needs the S3 ManifestPublisher (phase 2b), and
-// slurm.Resume returns a clear error for collective partitions until then.
+// is wired to an S3 manifest publisher when Q0_MANIFEST_BUCKET is set, enabling
+// collective resume; otherwise it stays nil and slurm.Resume gates collective
+// partitions with a clear error. The Describer is always wired (the orphan
+// sweeper needs it).
 func BuildBridge(ctx context.Context, s Settings) (*slurm.Bridge, error) {
 	if err := s.Validate(); err != nil {
 		return nil, err
@@ -126,14 +134,25 @@ func BuildBridge(ctx context.Context, s Settings) (*slurm.Bridge, error) {
 		return nil, err
 	}
 
+	// Collective resume needs a real Assembler backed by an S3 manifest
+	// publisher. Wire one only when a manifest bucket is configured; when absent,
+	// Assembler stays nil and slurm.Resume keeps gating collective partitions
+	// with its clear error (no regression).
+	var assembler cohort.Assembler
+	if s.ManifestBucket != "" {
+		s3c := s3.NewFromConfig(awsCfg)
+		assembler = slurm.NewAssembler(awssub.NewS3Publisher(s3c, s.ManifestBucket))
+	}
+
 	return &slurm.Bridge{
 		Reconciler: func(asm cohort.Assembler) *cohort.Reconciler {
 			return cohort.NewReconciler(act, obs, clf, enr, asm, lim)
 		},
 		Actuator:  act,
-		Assembler: nil, // phase 2b: S3 ManifestPublisher
+		Assembler: assembler,
 		Scontrol:  slurm.NewScontrol(),
 		Records:   store,
+		Describer: obs, // *Observer.DescribeCluster satisfies slurm.ClusterDescriber
 		Cfg: slurm.Config{
 			Cluster:          s.Cluster,
 			Region:           s.Region,
