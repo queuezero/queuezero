@@ -4,48 +4,58 @@ import (
 	"context"
 
 	"github.com/queuezero/queuezero/internal/cohort"
+	"github.com/queuezero/queuezero/internal/mpi"
 )
 
 // Enroller implements cohort.Enroller for the Slurm domain.
-type Enroller struct{}
+//
+// The domain probe for phase 3: slurmd has checked in AND the node is
+// operational (mounts healthy, and — after a hibernate-resume — not lying with
+// stale mounts). In queuezero this truth is reported by spored on the node into
+// the q0:ready / q0:phase / q0:detail tags and surfaced by the hybrid AWS
+// Observer's ReadReadiness. The Slurm Enroller therefore adds nothing on top of
+// the MPI Enroller's readiness-tag probe — slurmd-check-in and mount-health are
+// exactly what spored already confirms before it writes q0:phase=enrolled.
+//
+// It delegates to mpi.Enroller (ARCHITECTURE §15: the readiness probe is shared;
+// only Slurm registration — the scontrol writeback in ResumeProgram — is
+// queuezero's). The probe is satisfied in production by *aws.Observer.
+type Enroller struct{ inner *mpi.Enroller }
 
-// IsEnrolled reports slurmd check-in AND mount health. A node can be running
-// in EC2 and idle in Slurm with a dead Lustre mount — and a hibernated node
-// lies convincingly, checking in instantly with stale mounts. So the probe
-// verifies both, and reports what it verified.
-func (Enroller) IsEnrolled(ctx context.Context, id cohort.EntityID) (cohort.Readiness, error) {
-	// TODO(phase-1): query slurmctld for node state; run/confirm a mount-health
-	// probe on the node. Return Readiness with both fields populated.
-	panic("slurm.Enroller.IsEnrolled: not yet implemented")
+// NewEnroller constructs a Slurm Enroller over a readiness probe (the AWS
+// Observer in production; a fake in tests).
+func NewEnroller(probe mpi.ReadinessProbe) *Enroller {
+	return &Enroller{inner: mpi.NewEnroller(probe)}
 }
 
-// Assembler implements cohort.Assembler for MPI cohorts. For a 1-cohort
-// (serial job) this is a no-op; for a collective cohort it performs the PMIx
-// address exchange so the ranks can find each other.
-type Assembler struct{}
-
-func (Assembler) Assemble(ctx context.Context, members []cohort.Observation) error {
-	// TODO(phase-1): publish the hostlist / drive the PMIx exchange. The cohort
-	// core has already guaranteed `members` is complete and simultaneously
-	// live — that guarantee is the thing Slurm never gave MPI.
-	panic("slurm.Assembler.Assemble: not yet implemented")
+// IsEnrolled reports slurmd check-in + mount health via the readiness probe.
+func (e *Enroller) IsEnrolled(ctx context.Context, id cohort.EntityID) (cohort.Readiness, error) {
+	return e.inner.IsEnrolled(ctx, id)
 }
 
-// ResumeProgram is the entry point Slurm invokes (the ASBX bridge). It
-// translates a Slurm hostlist into a cohort.Cohort, reconciles it, and writes
-// the Outcome back to scontrol — failed nodes marked down/drain IMMEDIATELY.
-func ResumeProgram(ctx context.Context, hostlist string) error {
-	// TODO(phase-1): parse hostlist -> []cohort.EntityIntent (rungs/budget from
-	// partitions.yaml); build cohort.Cohort (Collective => MinViable = len);
-	// run cohort.Reconciler.Reconcile; on failure mark nodes down via scontrol
-	// with Record.Summary() as the reason.
-	panic("slurm.ResumeProgram: not yet implemented")
+// Assembler implements cohort.Assembler for collective (MPI-over-Slurm) cohorts.
+//
+// The cohort core has already guaranteed `members` is complete and
+// simultaneously live — the barrier — which is the thing Slurm never gave MPI.
+// The PMIx wire-up itself is shared with the pure-MPI domain (ARCHITECTURE §15:
+// "Its MPI assembler may delegate to spawn's, since the wire-up is shared and
+// only Slurm-registration is queuezero's"), so this delegates to mpi.Assembler.
+// The Slurm-specific registration is the scontrol node-state writeback that
+// ResumeProgram does after Reconcile, not an assembly-phase concern.
+//
+// It is invoked ONLY for collective cohorts (the reconciler gates assembly on
+// IsCollective() && Assembler != nil); serial and partial cohorts pass a nil
+// Assembler.
+type Assembler struct{ inner *mpi.Assembler }
+
+// NewAssembler constructs a Slurm Assembler over a manifest publisher (S3 in
+// production; a fake in tests). The publisher is the payload channel that
+// carries the converged peer manifest (ARCHITECTURE §11).
+func NewAssembler(pub mpi.ManifestPublisher) *Assembler {
+	return &Assembler{inner: mpi.NewAssembler(pub)}
 }
 
-// SuspendProgram is the teardown entry point. Beyond stopping the named nodes,
-// queuezero runs a generation-tagged sweeper to reap orphaned instances —
-// a missed Terminate is a silent cost leak, not a visible failure.
-func SuspendProgram(ctx context.Context, hostlist string) error {
-	// TODO(phase-1): Stop/Terminate named entities; honor warm-pool intent.
-	panic("slurm.SuspendProgram: not yet implemented")
+// Assemble drives the PMIx wire-up over the complete, live cohort.
+func (a *Assembler) Assemble(ctx context.Context, members []cohort.Observation) error {
+	return a.inner.Assemble(ctx, members)
 }
