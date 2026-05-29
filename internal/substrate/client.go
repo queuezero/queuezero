@@ -38,6 +38,12 @@ type RunRequest struct {
 	IAMInstanceArn   string
 	EFA              bool
 	PlacementGroup   string
+
+	// UserData is the raw (un-encoded) instance userdata — a minimal
+	// fetch-and-exec shim ONLY, never application logic (ARCHITECTURE §11,
+	// non-negotiable #9). The aws layer base64-encodes it; it is immutable and
+	// size-capped once launched. Empty => no userdata (bare AMI boot).
+	UserData string
 }
 
 // Instance is the provider-agnostic view of one running thing.

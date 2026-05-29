@@ -37,6 +37,7 @@ const (
 	EnvGeneration    = "Q0_GENERATION"
 	EnvBootstrapS3   = "Q0_BOOTSTRAP_S3"
 	EnvManifestBucket = "Q0_MANIFEST_BUCKET"
+	EnvInstanceProfile = "Q0_INSTANCE_PROFILE_ARN"
 	EnvPartition     = "Q0_PARTITION"
 	envSlurmResumePartition = "SLURM_RESUME_PARTITION"
 
@@ -54,6 +55,10 @@ type Settings struct {
 	// ManifestBucket is the S3 bucket the collective peer manifest is published
 	// to. Empty => no Assembler is wired and collective resume stays gated.
 	ManifestBucket string
+	// InstanceProfileArn is the IAM instance profile attached to launched nodes
+	// so the bootstrap userdata shim can fetch the script-set from S3. Empty =>
+	// no profile attached.
+	InstanceProfileArn string
 	// Partition is the partition name slurmctld is resuming/suspending, if known
 	// (from --partition or the Slurm/Q0 env). Empty => resolve by node name.
 	Partition string
@@ -76,9 +81,10 @@ func SettingsFromEnv(partitionFlag string) Settings {
 		PartitionsYAML: os.Getenv(EnvPartitions),
 		StateDir:       stateDir,
 		Generation:     os.Getenv(EnvGeneration),
-		BootstrapS3:    os.Getenv(EnvBootstrapS3),
-		ManifestBucket: os.Getenv(EnvManifestBucket),
-		Partition:      partition,
+		BootstrapS3:        os.Getenv(EnvBootstrapS3),
+		ManifestBucket:     os.Getenv(EnvManifestBucket),
+		InstanceProfileArn: os.Getenv(EnvInstanceProfile),
+		Partition:          partition,
 	}
 }
 
@@ -123,6 +129,7 @@ func BuildBridge(ctx context.Context, s Settings) (*slurm.Bridge, error) {
 		ClusterName:        s.Cluster,
 		Region:             s.Region,
 		DefaultBootstrapS3: s.BootstrapS3,
+		InstanceProfileArn: s.InstanceProfileArn,
 	}
 	act := awssub.NewActuator(client, actCfg)
 	obs := awssub.NewObserver(client, actCfg)

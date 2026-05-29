@@ -2,6 +2,7 @@ package aws
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"time"
 
@@ -325,6 +326,11 @@ func runRequestToEC2(req substrate.RunRequest) *ec2.RunInstancesInput {
 				Tags:         mapToEC2Tags(req.Tags),
 			},
 		},
+	}
+	if req.UserData != "" {
+		// EC2 expects userdata base64-encoded. It is immutable for the life of
+		// the instance and carries only the fetch-exec shim (ARCHITECTURE §11).
+		in.UserData = awssdk.String(base64.StdEncoding.EncodeToString([]byte(req.UserData)))
 	}
 	if req.SubnetID != "" {
 		in.SubnetId = awssdk.String(req.SubnetID)

@@ -3,6 +3,7 @@ package aws
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/queuezero/queuezero/internal/cohort"
@@ -79,10 +80,17 @@ func (f *fakeSubstrateClient) DescribeTagsByID(_ context.Context, providerID str
 
 // ---- helpers ----------------------------------------------------------------
 
+// testBootstrapURI is content-addressed (64-char hex digest), as Launch now
+// requires — it bakes a verifying fetch shim into userdata.
+const testBootstrapSHA = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+const testBootstrapURI = "s3://gauss-bootstrap/scripts/" + testBootstrapSHA + ".tar.gz"
+
 func testCfg() ActuatorConfig {
 	return ActuatorConfig{
 		ClusterName:        "gauss",
-		DefaultBootstrapS3: "s3://gauss-bootstrap/scripts/abc123",
+		Region:             "us-east-1",
+		DefaultBootstrapS3: testBootstrapURI,
+		InstanceProfileArn: "arn:aws:iam::111122223333:instance-profile/q0-node",
 	}
 }
 
@@ -141,12 +149,67 @@ func TestActuator_Launch_OneEntityOneCall(t *testing.T) {
 	if req.Tags[tagGeneration] != "gen-1" {
 		t.Errorf("tag %q=%q want gen-1", tagGeneration, req.Tags[tagGeneration])
 	}
-	if req.Tags[tagBootstrapS3] != "s3://gauss-bootstrap/scripts/abc123" {
+	if req.Tags[tagBootstrapS3] != testBootstrapURI {
 		t.Errorf("tag %q=%q want bootstrap S3 URI", tagBootstrapS3, req.Tags[tagBootstrapS3])
 	}
 	// Observation must reflect launched entity.
 	if obs.ID != "gpu-001" {
 		t.Errorf("obs.ID=%q want gpu-001", obs.ID)
+	}
+}
+
+// Launch bakes a fetch-and-exec userdata shim referencing the content-addressed
+// bootstrap URI + its hash, and attaches the instance profile.
+func TestActuator_Launch_BootstrapShimAndProfile(t *testing.T) {
+	fake := &fakeSubstrateClient{}
+	a := newActuatorWithFake(fake)
+
+	if _, err := a.Launch(context.Background(), testIntent("gpu-001")); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+	req := fake.runReqs[0]
+	if req.IAMInstanceArn != "arn:aws:iam::111122223333:instance-profile/q0-node" {
+		t.Errorf("IAMInstanceArn=%q, want the instance profile", req.IAMInstanceArn)
+	}
+	if req.UserData == "" {
+		t.Fatal("Launch should bake a userdata shim when DefaultBootstrapS3 is set")
+	}
+	if !strings.Contains(req.UserData, testBootstrapURI) {
+		t.Errorf("shim should reference the bootstrap URI")
+	}
+	if !strings.Contains(req.UserData, testBootstrapSHA) || !strings.Contains(req.UserData, "sha256sum -c") {
+		t.Errorf("shim should verify the content-address digest")
+	}
+}
+
+// A non-content-addressed bootstrap URI fails closed — never launch a node whose
+// bootstrap cannot be verified.
+func TestActuator_Launch_NonContentAddressedBootstrap_Fails(t *testing.T) {
+	fake := &fakeSubstrateClient{}
+	cfg := testCfg()
+	cfg.DefaultBootstrapS3 = "s3://gauss-bootstrap/scripts/latest.tar.gz" // not a digest
+	a := &Actuator{client: fake, cfg: cfg}
+
+	if _, err := a.Launch(context.Background(), testIntent("gpu-001")); err == nil {
+		t.Fatal("expected Launch to fail closed on a non-content-addressed bootstrap URI")
+	}
+	if len(fake.runReqs) != 0 {
+		t.Error("must not call RunInstance when bootstrap is unverifiable")
+	}
+}
+
+// With no bootstrap configured, Launch leaves userdata empty (no regression).
+func TestActuator_Launch_NoBootstrap_NoUserData(t *testing.T) {
+	fake := &fakeSubstrateClient{}
+	cfg := testCfg()
+	cfg.DefaultBootstrapS3 = ""
+	a := &Actuator{client: fake, cfg: cfg}
+
+	if _, err := a.Launch(context.Background(), testIntent("gpu-001")); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+	if fake.runReqs[0].UserData != "" {
+		t.Error("no bootstrap configured => no userdata")
 	}
 }
 

@@ -10,6 +10,7 @@ import (
 
 	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
 
+	"github.com/queuezero/queuezero/internal/bootstrap"
 	"github.com/queuezero/queuezero/internal/cohort"
 	"github.com/queuezero/queuezero/internal/substrate"
 	"github.com/queuezero/queuezero/internal/tags"
@@ -48,6 +49,12 @@ type ActuatorConfig struct {
 	// TODO(step-4-cross-account): assume this role before constructing the
 	// substrate.Client for each Launch/Start call. Empty = single-account path.
 	CrossAccountRoleARN string
+
+	// InstanceProfileArn is the IAM instance profile attached to launched nodes,
+	// granting the userdata shim s3:GetObject on the bootstrap script bucket.
+	// Empty = no profile attached (the node cannot fetch from a private bucket).
+	// The profile itself is provisioned by the static substrate (OpenTofu).
+	InstanceProfileArn string
 }
 
 // substrateClient is the interface the Actuator and Observer program against.
@@ -88,9 +95,6 @@ func NewActuator(client *Client, cfg ActuatorConfig) *Actuator {
 // cohort, and S3 location of the bootstrap script-set (B5).
 func (a *Actuator) Launch(ctx context.Context, intent cohort.EntityIntent) (cohort.Observation, error) {
 	launchTags := a.baseTags(intent)
-	if a.cfg.DefaultBootstrapS3 != "" {
-		launchTags[tagBootstrapS3] = a.cfg.DefaultBootstrapS3
-	}
 
 	req := substrate.RunRequest{
 		AMI:              intent.Rung.InstanceType, // NOTE: AMI lookup from partitions.yaml is caller's job
@@ -98,7 +102,29 @@ func (a *Actuator) Launch(ctx context.Context, intent cohort.EntityIntent) (coho
 		AvailZone:        intent.Rung.AvailZone,
 		Spot:             intent.Rung.CapacityModel == cohort.CapacitySpot,
 		IdempotencyToken: intent.IdempotencyToken,
+		IAMInstanceArn:   a.cfg.InstanceProfileArn,
 		Tags:             launchTags,
+	}
+
+	// Bootstrap delivery (ARCHITECTURE §11): write the script-set location as a
+	// tag for legibility (q0 explain shows what a node ran) AND bake a minimal
+	// fetch-and-exec shim into userdata so the node actually fetches+runs it.
+	if a.cfg.DefaultBootstrapS3 != "" {
+		launchTags[tagBootstrapS3] = a.cfg.DefaultBootstrapS3
+		sha, err := sha256FromKey(a.cfg.DefaultBootstrapS3)
+		if err != nil {
+			// Fail closed: never launch a node we cannot verify the bootstrap of.
+			return cohort.Observation{}, fmt.Errorf("entity %s: %w", intent.ID, err)
+		}
+		shim, err := bootstrap.Shim(bootstrap.Params{
+			S3URI:  a.cfg.DefaultBootstrapS3,
+			SHA256: sha,
+			Region: a.cfg.Region,
+		})
+		if err != nil {
+			return cohort.Observation{}, fmt.Errorf("entity %s: %w", intent.ID, err)
+		}
+		req.UserData = shim
 	}
 
 	inst, err := a.client.RunInstance(ctx, req)
@@ -278,6 +304,34 @@ func (o *Observer) readInstanceTags(ctx context.Context, providerID string) (map
 }
 
 // ---- helpers ----------------------------------------------------------------
+
+// sha256FromKey extracts the content-address digest from a bootstrap S3 URI of
+// the form s3://bucket/.../<sha256>.tar.gz (or <sha256>.tgz / bare <sha256>).
+// It returns an error if the basename is not a 64-char lowercase hex digest —
+// the script-set MUST be content-addressed so the node can verify what it ran.
+func sha256FromKey(uri string) (string, error) {
+	base := uri
+	if i := strings.LastIndexByte(base, '/'); i >= 0 {
+		base = base[i+1:]
+	}
+	base = strings.TrimSuffix(base, ".gz")
+	base = strings.TrimSuffix(base, ".tar")
+	base = strings.TrimSuffix(base, ".tgz")
+	if len(base) != 64 || !isHex(base) {
+		return "", fmt.Errorf("bootstrap URI %q is not content-addressed "+
+			"(expected s3://.../<sha256>.tar.gz); refusing to launch an unverifiable node", uri)
+	}
+	return base, nil
+}
+
+func isHex(s string) bool {
+	for _, r := range s {
+		if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f')) {
+			return false
+		}
+	}
+	return true
+}
 
 func (a *Actuator) baseTags(intent cohort.EntityIntent) map[string]string {
 	return map[string]string{

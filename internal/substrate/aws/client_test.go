@@ -2,9 +2,11 @@ package aws
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"net"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -24,6 +26,7 @@ type fakeEC2 struct {
 	runResponses  []runResponse
 	runCallCount  int32 // atomic
 	runTokensSeen []string
+	lastUserData  string // decoded from the last RunInstances input
 
 	startErr error
 	stopErr  error
@@ -46,6 +49,11 @@ func (f *fakeEC2) RunInstances(_ context.Context, in *ec2.RunInstancesInput, _ .
 	n := int(atomic.AddInt32(&f.runCallCount, 1)) - 1
 	if in.ClientToken != nil {
 		f.runTokensSeen = append(f.runTokensSeen, *in.ClientToken)
+	}
+	if in.UserData != nil {
+		if dec, derr := base64.StdEncoding.DecodeString(*in.UserData); derr == nil {
+			f.lastUserData = string(dec)
+		}
 	}
 	if n < len(f.runResponses) {
 		r := f.runResponses[n]
@@ -356,6 +364,32 @@ func TestClient_DescribeByTag_PopulatesGenerationEntityLaunchTime(t *testing.T) 
 	}
 	if !got.LaunchTime.Equal(launch) {
 		t.Errorf("LaunchTime=%v want %v", got.LaunchTime, launch)
+	}
+}
+
+// RunInstance base64-encodes RunRequest.UserData onto the EC2 input; an empty
+// UserData leaves it unset.
+func TestClient_RunInstance_UserDataEncoded(t *testing.T) {
+	fake := &fakeEC2{}
+	c := newClient(fake)
+	req := runReq("tok-ud")
+	req.UserData = "#!/bin/bash\necho hi\n"
+	if _, err := c.RunInstance(context.Background(), req); err != nil {
+		t.Fatalf("RunInstance: %v", err)
+	}
+	if !strings.Contains(fake.lastUserData, "echo hi") {
+		t.Errorf("decoded userdata=%q, want it to contain the shim", fake.lastUserData)
+	}
+}
+
+func TestClient_RunInstance_NoUserData(t *testing.T) {
+	fake := &fakeEC2{}
+	c := newClient(fake)
+	if _, err := c.RunInstance(context.Background(), runReq("tok-none")); err != nil {
+		t.Fatalf("RunInstance: %v", err)
+	}
+	if fake.lastUserData != "" {
+		t.Errorf("expected no userdata, got %q", fake.lastUserData)
 	}
 }
 
