@@ -12,21 +12,24 @@ import (
 
 	"github.com/queuezero/queuezero/internal/cohort"
 	"github.com/queuezero/queuezero/internal/substrate"
+	"github.com/queuezero/queuezero/internal/tags"
 )
 
-// Tag key constants for the q0 control channel.
-// Tags carry small signals; S3 carries payloads (ARCHITECTURE §11).
+// Tag key constants for the q0 control channel — aliased from internal/tags,
+// the single source of truth shared with the on-node reporter (internal/spored)
+// so the writer and this reader can never drift. Tags carry small signals; S3
+// carries payloads (ARCHITECTURE §11).
 const (
-	tagCluster     = "q0:cluster"
-	tagEntity      = "q0:entity"
-	tagGeneration  = "q0:generation"
-	tagCohort      = "q0:cohort"
-	tagBootstrapS3 = "q0:bootstrap-s3"  // S3 URI of the hash-pinned bootstrap script-set
+	tagCluster     = tags.Cluster
+	tagEntity      = tags.Entity
+	tagGeneration  = tags.Generation
+	tagCohort      = tags.Cohort
+	tagBootstrapS3 = tags.BootstrapS3
 
 	// spored-written readiness tags (phase 3, read-only for the observer).
-	tagPhase  = "q0:phase"
-	tagReady  = "q0:ready"
-	tagDetail = "q0:detail"
+	tagPhase  = tags.Phase
+	tagReady  = tags.Ready
+	tagDetail = tags.Detail
 )
 
 // ActuatorConfig holds the account + cluster configuration needed to launch
@@ -84,9 +87,9 @@ func NewActuator(client *Client, cfg ActuatorConfig) *Actuator {
 // Writes the config tags ASBX owns at launch: cluster, entity, generation,
 // cohort, and S3 location of the bootstrap script-set (B5).
 func (a *Actuator) Launch(ctx context.Context, intent cohort.EntityIntent) (cohort.Observation, error) {
-	tags := a.baseTags(intent)
+	launchTags := a.baseTags(intent)
 	if a.cfg.DefaultBootstrapS3 != "" {
-		tags[tagBootstrapS3] = a.cfg.DefaultBootstrapS3
+		launchTags[tagBootstrapS3] = a.cfg.DefaultBootstrapS3
 	}
 
 	req := substrate.RunRequest{
@@ -95,7 +98,7 @@ func (a *Actuator) Launch(ctx context.Context, intent cohort.EntityIntent) (coho
 		AvailZone:        intent.Rung.AvailZone,
 		Spot:             intent.Rung.CapacityModel == cohort.CapacitySpot,
 		IdempotencyToken: intent.IdempotencyToken,
-		Tags:             tags,
+		Tags:             launchTags,
 	}
 
 	inst, err := a.client.RunInstance(ctx, req)
@@ -187,11 +190,11 @@ func (o *Observer) Observe(ctx context.Context, ids []cohort.EntityID) ([]cohort
 }
 
 func (o *Observer) observeOne(ctx context.Context, id cohort.EntityID) (cohort.Observation, error) {
-	tags := map[string]string{
+	filter := map[string]string{
 		tagCluster: o.cfg.ClusterName,
 		tagEntity:  string(id),
 	}
-	instances, err := o.client.DescribeByTag(ctx, tags)
+	instances, err := o.client.DescribeByTag(ctx, filter)
 	if err != nil {
 		return cohort.Observation{ID: id, State: cohort.StateUnknown, ObservedAt: time.Now()}, err
 	}
@@ -231,11 +234,11 @@ func (o *Observer) DescribeCluster(ctx context.Context, cluster string) ([]subst
 // q0:ready=false → not ready (spored is running but mounts/slurmd haven't passed).
 // q0:ready=true AND q0:phase=enrolled → Readiness.OK() == true.
 func (o *Observer) ReadReadiness(ctx context.Context, id cohort.EntityID) (cohort.Readiness, error) {
-	tags := map[string]string{
+	filter := map[string]string{
 		tagCluster: o.cfg.ClusterName,
 		tagEntity:  string(id),
 	}
-	instances, err := o.client.DescribeByTag(ctx, tags)
+	instances, err := o.client.DescribeByTag(ctx, filter)
 	if err != nil {
 		// Describe error → treat as not-yet-ready, not a failure.
 		return cohort.Readiness{}, nil
@@ -259,7 +262,7 @@ func (o *Observer) ReadReadiness(ctx context.Context, id cohort.EntityID) (cohor
 	// Mount health is signalled by q0:phase=enrolled (spored only advances to
 	// enrolled after confirming mounts). A node can be running+idle with a dead
 	// Lustre mount; this is the probe that catches it (ARCHITECTURE §7).
-	mountHealthy := strings.EqualFold(phase, "enrolled")
+	mountHealthy := strings.EqualFold(phase, tags.PhaseEnrolled)
 
 	return cohort.Readiness{
 		Enrolled:     ready && mountHealthy,

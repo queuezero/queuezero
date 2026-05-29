@@ -31,6 +31,10 @@ type fakeEC2 struct {
 
 	describeInstances []ec2types.Instance
 	describeErr       error
+
+	createTagsErr      error
+	createTagsResource string            // last Resources[0]
+	createTagsSeen     map[string]string // last tags written
 }
 
 type runResponse struct {
@@ -88,6 +92,20 @@ func (f *fakeEC2) DescribeInstances(_ context.Context, _ *ec2.DescribeInstancesI
 
 func (f *fakeEC2) DescribeTags(_ context.Context, _ *ec2.DescribeTagsInput, _ ...func(*ec2.Options)) (*ec2.DescribeTagsOutput, error) {
 	return &ec2.DescribeTagsOutput{}, nil
+}
+
+func (f *fakeEC2) CreateTags(_ context.Context, in *ec2.CreateTagsInput, _ ...func(*ec2.Options)) (*ec2.CreateTagsOutput, error) {
+	if f.createTagsErr != nil {
+		return nil, f.createTagsErr
+	}
+	if len(in.Resources) > 0 {
+		f.createTagsResource = in.Resources[0]
+	}
+	f.createTagsSeen = map[string]string{}
+	for _, t := range in.Tags {
+		f.createTagsSeen[awssdk.ToString(t.Key)] = awssdk.ToString(t.Value)
+	}
+	return &ec2.CreateTagsOutput{}, nil
 }
 
 // ---- helpers ----------------------------------------------------------------
@@ -338,6 +356,46 @@ func TestClient_DescribeByTag_PopulatesGenerationEntityLaunchTime(t *testing.T) 
 	}
 	if !got.LaunchTime.Equal(launch) {
 		t.Errorf("LaunchTime=%v want %v", got.LaunchTime, launch)
+	}
+}
+
+// Tag writes the given tags to the named instance via CreateTags, through the
+// rate limiter.
+func TestClient_Tag(t *testing.T) {
+	fake := &fakeEC2{}
+	c := newClient(fake)
+
+	err := c.Tag(context.Background(), "i-node", map[string]string{
+		"q0:phase": "enrolled", "q0:ready": "true",
+	})
+	if err != nil {
+		t.Fatalf("Tag: %v", err)
+	}
+	if fake.createTagsResource != "i-node" {
+		t.Errorf("resource=%q want i-node", fake.createTagsResource)
+	}
+	if fake.createTagsSeen["q0:phase"] != "enrolled" || fake.createTagsSeen["q0:ready"] != "true" {
+		t.Errorf("tags not written correctly: %v", fake.createTagsSeen)
+	}
+}
+
+func TestClient_Tag_EmptyIsNoop(t *testing.T) {
+	fake := &fakeEC2{}
+	c := newClient(fake)
+	if err := c.Tag(context.Background(), "i-node", nil); err != nil {
+		t.Fatalf("empty Tag should be a no-op, got %v", err)
+	}
+	if fake.createTagsSeen != nil {
+		t.Error("empty Tag must not call CreateTags")
+	}
+}
+
+func TestClient_Tag_ClassifiesError(t *testing.T) {
+	fake := &fakeEC2{createTagsErr: errors.New("UnauthorizedOperation")}
+	c := newClient(fake)
+	err := c.Tag(context.Background(), "i-node", map[string]string{"q0:ready": "true"})
+	if err == nil {
+		t.Fatal("expected error from CreateTags")
 	}
 }
 

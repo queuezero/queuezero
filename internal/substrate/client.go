@@ -18,6 +18,10 @@ type Client interface {
 	// DescribeByTag is eventually consistent and ADVISORY. Callers must treat
 	// a miss as lag and consult the idempotency token for ground truth.
 	DescribeByTag(ctx context.Context, tags map[string]string) ([]Instance, error)
+
+	// Tag writes (creates/overwrites) tags on one instance. This is the on-node
+	// reporter's signal channel (q0:phase/q0:ready/q0:detail). Idempotent.
+	Tag(ctx context.Context, providerID string, tags map[string]string) error
 }
 
 // RunRequest is a single-instance launch. There is deliberately no

@@ -179,6 +179,30 @@ func (c *Client) DescribeTagsByID(ctx context.Context, providerID string) (map[s
 	return result, nil
 }
 
+// Tag writes (creates or overwrites) tags on one instance. It is the node-side
+// reporter's signal channel: the on-node q0-spored writes q0:phase/q0:ready/
+// q0:detail onto its own instance through this path. Like every mutation it
+// passes through the account rate limiter and classifies provider errors.
+//
+// CreateTags is idempotent (re-writing the same key/value is a no-op on the
+// provider), so no idempotency token is needed.
+func (c *Client) Tag(ctx context.Context, providerID string, kv map[string]string) error {
+	if len(kv) == 0 {
+		return nil
+	}
+	if err := c.limiter.Acquire(ctx); err != nil {
+		return err
+	}
+	_, err := c.ec2.CreateTags(ctx, &ec2.CreateTagsInput{
+		Resources: []string{providerID},
+		Tags:      mapToEC2Tags(kv),
+	})
+	if err != nil {
+		return faultErr(c.clf.Classify(err))
+	}
+	return nil
+}
+
 // DescribeByTag returns instances matching all provided tag key=value pairs.
 // Results are ADVISORY and eventually consistent (B5): a miss on a freshly
 // launched instance is StateUnknown, not StateAbsent. The idempotency token
