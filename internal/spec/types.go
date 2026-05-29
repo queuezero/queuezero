@@ -53,6 +53,12 @@ type Partition struct {
 	WarmPool         WarmPoolSpec  `yaml:"warmPool"`
 	Budget           *BudgetSpec   `yaml:"budget,omitempty"`     // overrides DefaultBudget
 	Collective       bool          `yaml:"collective"`           // true => MPI-style all-or-nothing barrier
+
+	// NodePrefix optionally decouples the Slurm node-name prefix from the
+	// partition Name, for resolving which partition a bare node name belongs to
+	// when slurmctld did not pass the partition explicitly. Empty => match
+	// against Name. See internal/spec.PartitionIndex.ResolveForNode.
+	NodePrefix string `yaml:"nodePrefix,omitempty"`
 }
 
 // Rung is one option in a fallback chain. ASBA may PROPOSE rungs; the operator
