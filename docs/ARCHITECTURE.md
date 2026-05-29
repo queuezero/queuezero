@@ -275,7 +275,8 @@ never "the fleet, currently 38, wants 40": **Running**, **Stopped** (warm — EB
 hibernation natively, so `Stopped`/`Hibernated` map straight onto it — there is no warm-pool gap.
 
 **The spore.host suite is queuezero's provider substrate.** It is a multi-module monorepo at
-`github.com/spore-host/spore-host` (each tool — e.g. `spawn` — is its own Go module); queuezero
+`github.com/spore-host/spore-host` (each tool — e.g. `spawn` — is its own Go module, import path
+`github.com/spore-host/spawn`, dropping the repo segment); queuezero
 links the relevant modules as libraries, **not** by shelling out to their CLIs. Linked-as-library
 means a classified error arrives as a Go value, not parsed stderr.
 

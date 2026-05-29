@@ -273,7 +273,7 @@ path and is the conceptual heart of the spore.host suite. It should sit at the
 same level as `spawn`, `truffle`, `lagotto`, `spored` — a top-level peer.
 
 **Version:** starts at `v0.x`, explicitly pre-1.0. Interfaces are still movable
-in coordinated commits across `spore-host/cohort`, `spore-host/spore-host/spawn`,
+in coordinated commits across `github.com/spore-host/cohort`, `github.com/spore-host/spawn`,
 and `queuezero/queuezero`.
 
 **v1.0 is earned by the co-proof (ARCHITECTURE §15):** the same unmodified cohort

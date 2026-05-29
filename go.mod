@@ -23,8 +23,10 @@ require (
 // versions in CLAUDE.md once confirmed. They are deliberately NOT required yet
 // so the scaffold builds clean:
 //
-//   ASBX  aws-slurm-burst          — Slurm resume/suspend bridge (embed as lib)
-//   ASBA  aws-slurm-burst-advisor  — capacity fallback-chain advisor
-//   ASBB  aws-slurm-burst-budget   — spend-rate admission control
-//   spore.host  github.com/spore-host/spore-host — fleet lifecycle + truffle
+//   ASBX  github.com/scttfrdmn/aws-slurm-burst         v0.4.0 — Slurm resume/suspend bridge (embed as lib)
+//   ASBA  github.com/scttfrdmn/aws-slurm-burst-advisor v0.3.0 — capacity fallback-chain advisor
+//   ASBB  github.com/scttfrdmn/aws-slurm-burst-budget  v0.2.0 — spend-rate admission control
+//   ASBC  aws-slurm-burst-config — config/spec layer; local placeholder ~/src/aws-slurm-burst-config (empty)
+//   spore.host  repo github.com/spore-host/spore-host; modules drop the repo segment
+//               (spawn=github.com/spore-host/spawn, truffle, lagotto) — fleet lifecycle + truffle
 //   aws-sdk-go-v2 — added with the substrate/aws implementation (phase 1)

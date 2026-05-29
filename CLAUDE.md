@@ -65,8 +65,9 @@ and the Slurm domain both compile against an unmodified core. Do not propose ext
 
 ## The spore.host suite — queuezero's provider substrate
 
-Monorepo at `github.com/spore-host/spore-host` — multi-module (e.g. `spawn` has its own
-`go.mod`; import path `github.com/spore-host/spore-host/spawn`). Linked as libraries.
+Monorepo at `github.com/spore-host/spore-host` — multi-module, and each module's import path
+DROPS the repo segment: `spawn` has its own `go.mod` with module path
+`github.com/spore-host/spawn` (likewise `.../truffle`, `.../lagotto`). Linked as libraries.
 
 | Tool | Role for queuezero | Notes |
 |---|---|---|
@@ -78,13 +79,17 @@ Monorepo at `github.com/spore-host/spore-host` — multi-module (e.g. `spawn` ha
 `spawn/pkg/slurm` is only an sbatch-file *parser* (import convenience) — spawn does not speak
 Slurm at runtime. That parser has shared lineage with `q0 import` job-level parsing; reuse it.
 
-## ASBX / ASBA / ASBB
+## ASBX / ASBA / ASBB — the aws-slurm-burst repos
+
+The ASB* names are the **`aws-slurm-burst` family** under `github.com/scttfrdmn`. These are
+the existing, shipping tools queuezero's Slurm domain links and consolidates.
 
 | Name | Role | Module path |
 |---|---|---|
-| **ASBX** | The Slurm `ResumeProgram`/`SuspendProgram` Go binaries — link cohort directly. Slurm domain (`Enroller`/`Assembler`). | _TODO: pin_ |
-| **ASBA** | Proposes fallback-chain rungs; overlaps truffle. | _TODO: pin / consolidate_ |
-| **ASBB** | Spend-rate admission control — the real scheduler. Owns warm-pool size + fast-fail-vs-lagotto policy. | _TODO: pin_ |
+| **ASBX** | The Slurm `ResumeProgram`/`SuspendProgram` Go binaries — link cohort directly. Slurm domain (`Enroller`/`Assembler`). MPI + EFA support already present. | `github.com/scttfrdmn/aws-slurm-burst` (v0.4.0) |
+| **ASBA** | Proposes fallback-chain rungs; analyzes job history, recommends instance types. Overlaps truffle. | `github.com/scttfrdmn/aws-slurm-burst-advisor` (v0.3.0) |
+| **ASBB** | Spend-rate admission control — the real scheduler. Budget mgmt + incremental allocation. Owns warm-pool size + fast-fail-vs-lagotto policy. | `github.com/scttfrdmn/aws-slurm-burst-budget` (v0.2.0) |
+| **ASBC** | Config/spec layer for the aws-slurm-burst family. | `aws-slurm-burst-config` — _local placeholder at `~/src/aws-slurm-burst-config` (empty, unpublished); pin module path when populated_ |
 
 Integration intent: `internal/slurm` *is* ASBX — the resume/suspend programs parse a Slurm
 hostlist into a `cohort.Cohort`, reconcile, and write the Outcome back via `scontrol`
