@@ -38,6 +38,8 @@ const (
 	EnvBootstrapS3   = "Q0_BOOTSTRAP_S3"
 	EnvManifestBucket = "Q0_MANIFEST_BUCKET"
 	EnvScriptsBucket = "Q0_SCRIPTS_BUCKET"
+	EnvStateBucket   = "Q0_STATE_BUCKET"
+	EnvLockTable     = "Q0_LOCK_TABLE"
 	EnvInstanceProfile = "Q0_INSTANCE_PROFILE_ARN"
 	EnvPartition     = "Q0_PARTITION"
 	envSlurmResumePartition = "SLURM_RESUME_PARTITION"

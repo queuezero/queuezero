@@ -9,9 +9,11 @@ import (
 	"bytes"
 	"fmt"
 	"os"
+	"path/filepath"
 	"time"
 
 	awssdkconfig "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/spf13/cobra"
 
@@ -20,7 +22,9 @@ import (
 	"github.com/queuezero/queuezero/internal/cohort"
 	"github.com/queuezero/queuezero/internal/recordstore"
 	"github.com/queuezero/queuezero/internal/slurm"
+	"github.com/queuezero/queuezero/internal/spec"
 	awssub "github.com/queuezero/queuezero/internal/substrate/aws"
+	"github.com/queuezero/queuezero/internal/tofu"
 )
 
 var version = "0.0.0-dev"
@@ -59,13 +63,119 @@ func main() {
 // cmdApply applies one or more composable spec layers (cluster.yaml,
 // stack.yaml, partitions.yaml, users.yaml), each independently content-hashed.
 func cmdApply() *cobra.Command {
-	return &cobra.Command{
-		Use:   "apply [layer]",
-		Short: "apply a composable spec layer (cluster|stack|partitions|users)",
-		RunE: func(*cobra.Command, []string) error {
-			return fmt.Errorf("not yet implemented — see docs/ARCHITECTURE.md §2")
+	var region, clusterYAML, workdir string
+	var scriptsBucket, manifestBucket, stateBucket, lockTable string
+	var approve, dryRun bool
+	c := &cobra.Command{
+		Use:   "apply <layer>",
+		Short: "apply a composable spec layer (cluster only in this phase)",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			layer := args[0]
+			if layer != "cluster" {
+				return fmt.Errorf("layer %q not yet implemented (this phase: cluster — the IAM/buckets foundation)", layer)
+			}
+			if clusterYAML == "" {
+				clusterYAML = "cluster.yaml"
+			}
+			cl, err := spec.LoadCluster(clusterYAML)
+			if err != nil {
+				return err
+			}
+			if region == "" {
+				region = firstNonEmpty(cl.Region, os.Getenv(asbx.EnvRegion))
+			}
+			if scriptsBucket == "" {
+				scriptsBucket = firstNonEmpty(os.Getenv(asbx.EnvScriptsBucket), cl.Name+"-q0-scripts")
+			}
+			if manifestBucket == "" {
+				manifestBucket = os.Getenv(asbx.EnvManifestBucket)
+			}
+			if stateBucket == "" {
+				stateBucket = firstNonEmpty(os.Getenv(asbx.EnvStateBucket), cl.Name+"-q0-state")
+			}
+			if lockTable == "" {
+				lockTable = firstNonEmpty(os.Getenv(asbx.EnvLockTable), cl.Name+"-q0-lock")
+			}
+			if workdir == "" {
+				workdir = filepath.Join(".q0", "tofu", layer)
+			}
+
+			files, err := tofu.GenerateClusterFoundation(cl, tofu.FoundationOpts{
+				ScriptsBucket:  scriptsBucket,
+				ManifestBucket: manifestBucket,
+			})
+			if err != nil {
+				return err
+			}
+			if err := tofu.WriteFiles(workdir, files); err != nil {
+				return err
+			}
+			hash, _ := cl.ContentHash()
+
+			if dryRun {
+				fmt.Printf("layer=cluster hash=%s region=%s workdir=%s\n", hash, region, workdir)
+				fmt.Printf("would provision: scripts bucket %q, manifest bucket %q, IAM instance profile q0-node, state backend %q/%q\n",
+					scriptsBucket, manifestBucket, stateBucket, lockTable)
+				fmt.Println("rendered HCL written; no AWS touched (--dry-run)")
+				return nil
+			}
+			if region == "" {
+				return fmt.Errorf("no region: set cluster.yaml region, --region, or %s", asbx.EnvRegion)
+			}
+
+			backend := tofu.BackendConfig{Bucket: stateBucket, LockTable: lockTable, Region: region, Key: layer + "/terraform.tfstate"}
+			awsCfg, err := awssdkconfig.LoadDefaultConfig(cmd.Context(), awssdkconfig.WithRegion(region))
+			if err != nil {
+				return fmt.Errorf("load AWS config: %w", err)
+			}
+			if err := tofu.EnsureBackend(cmd.Context(), backend, s3.NewFromConfig(awsCfg), dynamodb.NewFromConfig(awsCfg)); err != nil {
+				return err
+			}
+			ex, err := tofu.NewExecutor()
+			if err != nil {
+				return err
+			}
+			if err := ex.Init(cmd.Context(), workdir, backend); err != nil {
+				return err
+			}
+			plan, err := ex.Plan(cmd.Context(), workdir)
+			if err != nil {
+				return err
+			}
+			if !approve {
+				fmt.Printf("layer=cluster hash=%s — plan complete (changes pending: %v)\n", hash, plan.ChangesPending)
+				fmt.Println("re-run with --approve to apply")
+				return nil
+			}
+			if err := ex.Apply(cmd.Context(), workdir); err != nil {
+				return err
+			}
+			fmt.Printf("layer=cluster hash=%s applied\n", hash)
+			fmt.Printf("pin outputs: %s / %s (see `tofu -chdir=%s output`)\n", asbx.EnvInstanceProfile, asbx.EnvScriptsBucket, workdir)
+			return nil
 		},
 	}
+	c.Flags().StringVar(&clusterYAML, "file", "", "path to cluster.yaml (default ./cluster.yaml)")
+	c.Flags().StringVar(&region, "region", "", "AWS region (else cluster.yaml region / $"+asbx.EnvRegion+")")
+	c.Flags().StringVar(&scriptsBucket, "scripts-bucket", "", "S3 bucket for bootstrap script-sets (else $"+asbx.EnvScriptsBucket+")")
+	c.Flags().StringVar(&manifestBucket, "manifest-bucket", "", "S3 bucket for collective peer manifests (else $"+asbx.EnvManifestBucket+")")
+	c.Flags().StringVar(&stateBucket, "state-bucket", "", "S3 bucket for tofu state (else $"+asbx.EnvStateBucket+")")
+	c.Flags().StringVar(&lockTable, "lock-table", "", "DynamoDB table for tofu state lock (else $"+asbx.EnvLockTable+")")
+	c.Flags().StringVar(&workdir, "workdir", "", "where generated HCL is written (default .q0/tofu/<layer>)")
+	c.Flags().BoolVar(&approve, "approve", false, "apply the plan (default: plan only)")
+	c.Flags().BoolVar(&dryRun, "dry-run", false, "render HCL and print intent; touch no AWS or tofu")
+	return c
+}
+
+// firstNonEmpty returns the first non-empty string.
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 // cmdPreflight checks quotas, IAM (SimulatePrincipalPolicy), instance-type
