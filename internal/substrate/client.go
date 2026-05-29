@@ -1,6 +1,9 @@
 package substrate
 
-import "context"
+import (
+	"context"
+	"time"
+)
 
 // Client is the single chokepoint to a cloud provider's elastic-fleet API.
 // It wraps a raw provider SDK with idempotency, classification, and rate
@@ -40,4 +43,16 @@ type Instance struct {
 	PrivateAddr  string
 	InstanceType string
 	AvailZone    string
+
+	// Generation is the q0:generation tag value ("" if unset). The orphan
+	// sweeper reaps instances whose generation is superseded by the current
+	// spec generation. See ARCHITECTURE §12.
+	Generation string
+	// Entity is the q0:entity tag value ("" if unset) — the named entity this
+	// instance backs. The sweeper terminates by EntityID, never by raw provider
+	// ID through a bulk path (non-negotiable #2).
+	Entity string
+	// LaunchTime is the provider-reported launch time, used by the sweeper's
+	// grace period to tolerate the eventual consistency of tag-filtered Describe.
+	LaunchTime time.Time
 }

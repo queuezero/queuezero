@@ -8,11 +8,14 @@ package main
 import (
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/spf13/cobra"
 
+	"github.com/queuezero/queuezero/internal/asbx"
 	"github.com/queuezero/queuezero/internal/cohort"
 	"github.com/queuezero/queuezero/internal/recordstore"
+	"github.com/queuezero/queuezero/internal/slurm"
 )
 
 var version = "0.0.0-dev"
@@ -38,6 +41,7 @@ func main() {
 		cmdImport(),
 		cmdCapture(),
 		cmdExplain(),
+		cmdSweep(),
 	)
 
 	if err := root.Execute(); err != nil {
@@ -157,4 +161,47 @@ func defaultRecordsDir() string {
 		return d
 	}
 	return "/var/lib/queuezero/records"
+}
+
+// cmdSweep reaps generation-orphaned instances — those left behind by a missed
+// teardown (a crashed suspend, a superseded partitions.yaml apply). A missed
+// Terminate is a silent cost leak, not a visible failure (ARCHITECTURE §12), so
+// this is the durable backstop, run periodically (e.g. cron). It reads the same
+// Q0_* environment as q0-resume/q0-suspend.
+func cmdSweep() *cobra.Command {
+	var grace time.Duration
+	var dryRun bool
+	var partition string
+	c := &cobra.Command{
+		Use:   "sweep",
+		Short: "reap generation-orphaned instances left by missed teardowns",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			settings := asbx.SettingsFromEnv(partition)
+			bridge, err := asbx.BuildBridge(cmd.Context(), settings)
+			if err != nil {
+				return err
+			}
+			res, err := bridge.Sweep(cmd.Context(), slurm.SweepOptions{Grace: grace, DryRun: dryRun})
+			if err != nil {
+				return err
+			}
+			verb := "reaped"
+			if dryRun {
+				verb = "would reap"
+			}
+			for _, d := range res.Reaped {
+				fmt.Printf("%s %s (%s, gen=%s): %s\n", verb, d.Entity, d.ProviderID, d.Generation, d.Reason)
+			}
+			for _, d := range res.Spared {
+				fmt.Printf("spared %s (%s, gen=%s): %s\n", d.Entity, d.ProviderID, d.Generation, d.Reason)
+			}
+			fmt.Printf("sweep: %d %s, %d spared\n", len(res.Reaped), verb, len(res.Spared))
+			return nil
+		},
+	}
+	c.Flags().DurationVar(&grace, "grace", 10*time.Minute, "minimum age before a stale-generation instance is reaped")
+	c.Flags().BoolVar(&dryRun, "dry-run", false, "report what would be reaped without terminating")
+	c.Flags().StringVar(&partition, "partition", "", "partition hint (sweep is cluster-wide; rarely needed)")
+	return c
 }

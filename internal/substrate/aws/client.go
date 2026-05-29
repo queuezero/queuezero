@@ -3,7 +3,6 @@ package aws
 import (
 	"context"
 	"fmt"
-	"strings"
 	"time"
 
 	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
@@ -352,10 +351,17 @@ func instanceFromEC2(i ec2types.Instance) substrate.Instance {
 	if i.Placement != nil {
 		inst.AvailZone = awssdk.ToString(i.Placement.AvailabilityZone)
 	}
-	// Extract generation tag for DescribeByTag callers (B5).
+	if i.LaunchTime != nil {
+		inst.LaunchTime = awssdk.ToTime(i.LaunchTime)
+	}
+	// Surface the q0:generation and q0:entity tags so the orphan sweeper can
+	// identify superseded instances and terminate them by named entity.
 	for _, t := range i.Tags {
-		if strings.EqualFold(awssdk.ToString(t.Key), "q0:generation") {
-			break
+		switch awssdk.ToString(t.Key) {
+		case tagGeneration:
+			inst.Generation = awssdk.ToString(t.Value)
+		case tagEntity:
+			inst.Entity = awssdk.ToString(t.Value)
 		}
 	}
 	return inst

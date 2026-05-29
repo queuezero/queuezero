@@ -53,12 +53,12 @@ func (b *Bridge) Suspend(ctx context.Context, partition, hostlist string) error 
 		}
 	}
 
-	// TODO(phase-2b): generation-tagged orphan sweeper. A missed Terminate is a
-	// silent cost leak, not a visible failure (ARCHITECTURE §12). The sweeper
-	// diffs Observer.DescribeByTag{cluster, generation<current} against Slurm
-	// reality and reaps orphans, with a launch-time grace period to tolerate the
-	// eventual consistency of tag-filtered Describe. tagGeneration already exists
-	// on launched instances to support this.
+	// The generation-tagged orphan sweeper — the backstop for a missed Terminate
+	// (a silent cost leak, ARCHITECTURE §12) — is Bridge.Sweep (sweep.go),
+	// invoked separately via `q0 sweep` (cron), NOT from the per-call Suspend
+	// path. Suspend stays focused on its hostlist; the cluster-wide reap is an
+	// explicit maintenance pass so every suspend doesn't trigger a cluster-wide
+	// DescribeCluster.
 
 	if len(errs) > 0 {
 		return fmt.Errorf("slurm suspend: %d node(s) failed: %w", len(errs), errors.Join(errs...))

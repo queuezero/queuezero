@@ -213,6 +213,15 @@ func (o *Observer) observeOne(ctx context.Context, id cohort.EntityID) (cohort.O
 	}, nil
 }
 
+// DescribeCluster returns every instance currently tagged for this cluster,
+// regardless of generation or entity. It is the read the orphan sweeper needs:
+// generation inequality ("superseded") cannot be a server-side EC2 tag filter,
+// so the sweeper describes the whole cluster and filters generation in-process.
+// Advisory and eventually consistent, like all Describe data.
+func (o *Observer) DescribeCluster(ctx context.Context, cluster string) ([]substrate.Instance, error) {
+	return o.client.DescribeByTag(ctx, map[string]string{tagCluster: cluster})
+}
+
 // ReadReadiness reads the spored-written tags off a running entity to populate
 // phase-3 Readiness. Called by the reconciler after an entity reaches
 // StateRunning; it is separate from Observe because the two have different

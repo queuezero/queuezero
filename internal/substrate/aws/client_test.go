@@ -306,6 +306,41 @@ func TestClient_DescribeByTag_Found(t *testing.T) {
 	}
 }
 
+// instanceFromEC2 surfaces the q0:generation / q0:entity tags and LaunchTime so
+// the orphan sweeper can identify and reap superseded instances by name.
+func TestClient_DescribeByTag_PopulatesGenerationEntityLaunchTime(t *testing.T) {
+	launch := time.Date(2026, 5, 28, 12, 0, 0, 0, time.UTC)
+	fake := &fakeEC2{
+		describeInstances: []ec2types.Instance{
+			{
+				InstanceId: awssdk.String("i-gen"),
+				State:      &ec2types.InstanceState{Name: ec2types.InstanceStateNameRunning},
+				LaunchTime: awssdk.Time(launch),
+				Tags: []ec2types.Tag{
+					{Key: awssdk.String("q0:generation"), Value: awssdk.String("g3")},
+					{Key: awssdk.String("q0:entity"), Value: awssdk.String("gpu-007")},
+					{Key: awssdk.String("q0:cluster"), Value: awssdk.String("test")},
+				},
+			},
+		},
+	}
+	c := newClient(fake)
+	instances, err := c.DescribeByTag(context.Background(), map[string]string{"q0:cluster": "test"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	got := instances[0]
+	if got.Generation != "g3" {
+		t.Errorf("Generation=%q want g3", got.Generation)
+	}
+	if got.Entity != "gpu-007" {
+		t.Errorf("Entity=%q want gpu-007", got.Entity)
+	}
+	if !got.LaunchTime.Equal(launch) {
+		t.Errorf("LaunchTime=%v want %v", got.LaunchTime, launch)
+	}
+}
+
 // Terminal errors surface immediately without retry.
 func TestClient_RunInstance_TerminalNoRetry(t *testing.T) {
 	fake := &fakeEC2{runResponses: []runResponse{

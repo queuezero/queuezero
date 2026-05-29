@@ -36,9 +36,10 @@ type Config struct {
 type Bridge struct {
 	Reconciler func(asm cohort.Assembler) *cohort.Reconciler
 	Actuator   cohort.Actuator   // used by Suspend to stop/terminate named entities
-	Assembler  cohort.Assembler  // non-nil only when collective resume is supported (phase 2b: S3 publisher)
+	Assembler  cohort.Assembler  // non-nil only when collective resume is supported (S3 publisher)
 	Scontrol   Scontrol
 	Records    recordstore.Store
+	Describer  ClusterDescriber  // used by Sweep to enumerate cluster instances; nil disables sweep
 	Cfg        Config
 }
 
