@@ -15,6 +15,10 @@ queuezero is pre-release (`0.0.0-dev`); no versioned release has been tagged yet
 The entries below accumulate toward the first tagged release.
 
 ### Added
+- **Configurable VPC egress** (`cluster.yaml` `network.egress`): `nat-gateway` (managed NAT, the
+  default — unchanged), `nat-instance` (a ~$3/mo t4g.nano NAT instance), or `endpoints-only` (no
+  general egress — for fully-baked AMIs). S3 + DynamoDB gateway endpoints are now added to every
+  generated VPC (free) so bootstrap fetches and tofu-state traffic skip the priced NAT path. (#10)
 - **Reference node bootstrap script-set** (`scripts/bootstrap/`): the `bootstrap.sh` entrypoint the
   userdata shim execs — sources `/etc/q0/mounts`, mounts EFS shared storage, configures slurmd's
   `SlurmctldHost` (primary + standby) and starts `slurmd` + `q0-spored` — plus a `q0-spored.service`

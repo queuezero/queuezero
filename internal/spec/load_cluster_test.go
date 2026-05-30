@@ -84,6 +84,7 @@ func TestParseCluster_NetworkControllerValidation(t *testing.T) {
 		"generated bad cidr":   base + "network:\n  byo: false\n  cidr: not-a-cidr\n",
 		"controller no instancetype": base + "network:\n  byo: false\n  cidr: 10.0.0.0/16\ncontroller:\n  amiHash: ami-1\n",
 		"controller no ami":    base + "network:\n  byo: false\n  cidr: 10.0.0.0/16\ncontroller:\n  instanceType: m7i.large\n",
+		"bad egress mode":      base + "network:\n  byo: false\n  cidr: 10.0.0.0/16\n  egress: nat-deluxe\n",
 	}
 	for name, y := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -91,6 +92,16 @@ func TestParseCluster_NetworkControllerValidation(t *testing.T) {
 				t.Errorf("expected validation error for %q", name)
 			}
 		})
+	}
+	// Valid egress modes (and empty) parse.
+	for _, mode := range []string{"", "egress: nat-gateway\n", "egress: nat-instance\n", "egress: endpoints-only\n"} {
+		y := base + "network:\n  byo: false\n  cidr: 10.0.0.0/16\n"
+		if mode != "" {
+			y += "  " + mode
+		}
+		if _, err := ParseCluster([]byte(y)); err != nil {
+			t.Errorf("valid egress %q should pass: %v", mode, err)
+		}
 	}
 }
 

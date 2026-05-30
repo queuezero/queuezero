@@ -126,7 +126,11 @@ func cmdApply() *cobra.Command {
 			}
 			hash, _ := cl.ContentHash()
 
-			netDesc := fmt.Sprintf("generated VPC %s across %d AZ(s)", cl.Network.CIDR, azCount)
+			egress := cl.Network.Egress
+			if egress == "" {
+				egress = spec.EgressNATGateway
+			}
+			netDesc := fmt.Sprintf("generated VPC %s across %d AZ(s), egress=%s", cl.Network.CIDR, azCount, egress)
 			if cl.Network.BYO {
 				netDesc = fmt.Sprintf("BYO VPC %s", cl.Network.VPCID)
 			}

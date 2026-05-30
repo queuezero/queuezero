@@ -136,14 +136,71 @@ func TestGenerate_GeneratedNetwork(t *testing.T) {
 		`resource "aws_subnet" "public"`,
 		`count             = 2`,
 		`resource "aws_internet_gateway" "this"`,
-		`resource "aws_nat_gateway" "this"`,
+		`resource "aws_nat_gateway" "this"`,           // default egress = nat-gateway
 		`resource "aws_route_table" "private"`,
+		`nat_gateway_id         = aws_nat_gateway.this.id`, // private default route via NAT
+		`resource "aws_vpc_endpoint" "s3"`,            // free gateway endpoints in all modes
+		`resource "aws_vpc_endpoint" "dynamodb"`,
 		`resource "aws_security_group" "controller"`,
 		`resource "aws_security_group" "compute"`,
 		`local.vpc_id`,
 	} {
 		if !strings.Contains(net, w) {
 			t.Errorf("network.tf missing %q", w)
+		}
+	}
+	// Default mode must NOT render a NAT instance.
+	if strings.Contains(net, `resource "aws_instance" "nat"`) {
+		t.Error("default egress (nat-gateway) must not render a NAT instance")
+	}
+}
+
+// nat-instance egress => a NAT instance (not a managed gateway), the SSM AMI
+// data source, and the private default route via the instance ENI.
+func TestGenerate_Egress_NATInstance(t *testing.T) {
+	c := testCluster()
+	c.Network.Egress = "nat-instance"
+	files, err := GenerateClusterFoundation(c, FoundationOpts{ScriptsBucket: "b", AZCount: 2})
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	net := files["network.tf"]
+	for _, w := range []string{
+		`resource "aws_instance" "nat"`,
+		`source_dest_check           = false`,
+		`data "aws_ssm_parameter" "nat_ami"`,
+		`resource "aws_security_group" "nat"`,
+		`network_interface_id   = aws_instance.nat.primary_network_interface_id`,
+		`resource "aws_vpc_endpoint" "s3"`,
+	} {
+		if !strings.Contains(net, w) {
+			t.Errorf("nat-instance network.tf missing %q", w)
+		}
+	}
+	if strings.Contains(net, `resource "aws_nat_gateway"`) {
+		t.Error("nat-instance must not render a managed NAT gateway")
+	}
+}
+
+// endpoints-only egress => no NAT of any kind and no default (0.0.0.0/0) private
+// route; only the gateway endpoints reach AWS services.
+func TestGenerate_Egress_EndpointsOnly(t *testing.T) {
+	c := testCluster()
+	c.Network.Egress = "endpoints-only"
+	files, err := GenerateClusterFoundation(c, FoundationOpts{ScriptsBucket: "b", AZCount: 2})
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	net := files["network.tf"]
+	if strings.Contains(net, `resource "aws_nat_gateway"`) || strings.Contains(net, `resource "aws_instance" "nat"`) {
+		t.Error("endpoints-only must render no NAT gateway and no NAT instance")
+	}
+	if strings.Contains(net, `resource "aws_route" "private_default"`) {
+		t.Error("endpoints-only must have no default (0.0.0.0/0) private route")
+	}
+	for _, w := range []string{`resource "aws_vpc_endpoint" "s3"`, `resource "aws_vpc_endpoint" "dynamodb"`} {
+		if !strings.Contains(net, w) {
+			t.Errorf("endpoints-only network.tf missing %q", w)
 		}
 	}
 }
