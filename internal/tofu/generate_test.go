@@ -11,7 +11,28 @@ import (
 )
 
 func testCluster() *spec.Cluster {
-	return &spec.Cluster{Name: "gauss", ControlAccount: "111122223333", Region: "us-west-2"}
+	return &spec.Cluster{
+		Name: "gauss", ControlAccount: "111122223333", Region: "us-west-2",
+		Network: spec.NetworkSpec{BYO: false, CIDR: "10.0.0.0/16"},
+	}
+}
+
+// generatedWithController: generated VPC + a controller pet.
+func generatedWithController() *spec.Cluster {
+	c := testCluster()
+	c.Controller = spec.ControllerSpec{
+		InstanceType: "m7i.2xlarge", AMIHash: "ami-deadbeef",
+		StandbyHost: "gauss-ctl-2", StateDir: "/shared/state",
+	}
+	return c
+}
+
+// byoCluster: bring-your-own network, no controller.
+func byoCluster() *spec.Cluster {
+	return &spec.Cluster{
+		Name: "gauss", ControlAccount: "111122223333", Region: "us-west-2",
+		Network: spec.NetworkSpec{BYO: true, VPCID: "vpc-abc", SubnetIDs: []string{"subnet-1", "subnet-2"}},
+	}
 }
 
 func TestGenerateClusterFoundation_RendersExpectedResources(t *testing.T) {
@@ -88,6 +109,95 @@ func TestWriteFiles(t *testing.T) {
 		if _, err := os.ReadFile(filepath.Join(dir, n)); err != nil {
 			t.Errorf("%s not written: %v", n, err)
 		}
+	}
+}
+
+// Generated network renders VPC + per-AZ subnets + IGW + NAT + route tables + SGs.
+func TestGenerate_GeneratedNetwork(t *testing.T) {
+	files, err := GenerateClusterFoundation(testCluster(), FoundationOpts{ScriptsBucket: "b", AZCount: 2})
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	net := files["network.tf"]
+	for _, w := range []string{
+		`data "aws_availability_zones" "available"`,
+		`resource "aws_vpc" "this"`,
+		`cidr_block           = "10.0.0.0/16"`,
+		`resource "aws_subnet" "private"`,
+		`resource "aws_subnet" "public"`,
+		`count             = 2`,
+		`resource "aws_internet_gateway" "this"`,
+		`resource "aws_nat_gateway" "this"`,
+		`resource "aws_route_table" "private"`,
+		`resource "aws_security_group" "controller"`,
+		`resource "aws_security_group" "compute"`,
+		`local.vpc_id`,
+	} {
+		if !strings.Contains(net, w) {
+			t.Errorf("network.tf missing %q", w)
+		}
+	}
+}
+
+// BYO network renders the locals passthrough and NO aws_vpc.
+func TestGenerate_BYONetwork(t *testing.T) {
+	files, err := GenerateClusterFoundation(byoCluster(), FoundationOpts{ScriptsBucket: "b"})
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	net := files["network.tf"]
+	if strings.Contains(net, `resource "aws_vpc"`) {
+		t.Error("BYO network must not create a VPC")
+	}
+	if !strings.Contains(net, `vpc_id     = "vpc-abc"`) || !strings.Contains(net, `"subnet-1", "subnet-2"`) {
+		t.Errorf("BYO network should pass through vpc/subnets via locals:\n%s", net)
+	}
+	// SGs are still created (they reference local.vpc_id).
+	if !strings.Contains(net, `resource "aws_security_group" "controller"`) {
+		t.Error("SGs should be created even for BYO")
+	}
+}
+
+// Controller present => exactly one AMI-pinned aws_instance with the slurmctld tag.
+func TestGenerate_ControllerPresent(t *testing.T) {
+	files, err := GenerateClusterFoundation(generatedWithController(), FoundationOpts{ScriptsBucket: "b"})
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	ctl := files["controller.tf"]
+	for _, w := range []string{
+		`resource "aws_instance" "controller"`,
+		`ami                    = "ami-deadbeef"`,
+		`instance_type          = "m7i.2xlarge"`,
+		`Name          = "gauss-slurmctld"`,
+		`"q0:standby"  = "gauss-ctl-2"`,
+		`resource "aws_iam_instance_profile" "controller"`,
+	} {
+		if !strings.Contains(ctl, w) {
+			t.Errorf("controller.tf missing %q", w)
+		}
+	}
+	// Exactly one controller instance (a pet, not a count).
+	if n := strings.Count(ctl, `resource "aws_instance" "controller"`); n != 1 {
+		t.Errorf("want exactly 1 controller instance, got %d", n)
+	}
+	if strings.Contains(ctl, "count =") {
+		t.Error("controller must not use count (it is a named pet, not an ASG)")
+	}
+	out := files["outputs.tf"]
+	if !strings.Contains(out, "controller_private_ip") {
+		t.Error("outputs.tf should export controller_private_ip when a controller is present")
+	}
+}
+
+// Controller absent => no aws_instance.
+func TestGenerate_ControllerAbsent(t *testing.T) {
+	files, _ := GenerateClusterFoundation(testCluster(), FoundationOpts{ScriptsBucket: "b"})
+	if strings.Contains(files["controller.tf"], `resource "aws_instance"`) {
+		t.Error("no controller requested => no aws_instance")
+	}
+	if strings.Contains(files["outputs.tf"], "controller_private_ip") {
+		t.Error("no controller => no controller output")
 	}
 }
 

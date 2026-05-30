@@ -53,6 +53,45 @@ func TestParseCluster_MissingFields(t *testing.T) {
 	}
 }
 
+// A generated network with a valid CIDR and no controller (network-only bring-up).
+const generatedCluster = `
+name: gauss
+controlAccount: "111122223333"
+region: us-east-1
+network:
+  byo: false
+  cidr: 10.0.0.0/16
+`
+
+func TestParseCluster_GeneratedNetwork_NoController_OK(t *testing.T) {
+	c, err := ParseCluster([]byte(generatedCluster))
+	if err != nil {
+		t.Fatalf("generated network without controller should be valid: %v", err)
+	}
+	if c.Network.BYO || c.Network.CIDR != "10.0.0.0/16" {
+		t.Errorf("network not parsed: %+v", c.Network)
+	}
+}
+
+func TestParseCluster_NetworkControllerValidation(t *testing.T) {
+	base := "name: g\ncontrolAccount: \"1\"\nregion: us-east-1\n"
+	cases := map[string]string{
+		"byo without vpc":      base + "network:\n  byo: true\n  subnetIds: [s-1]\n",
+		"byo without subnets":  base + "network:\n  byo: true\n  vpcId: vpc-1\n",
+		"generated without cidr": base + "network:\n  byo: false\n",
+		"generated bad cidr":   base + "network:\n  byo: false\n  cidr: not-a-cidr\n",
+		"controller no instancetype": base + "network:\n  byo: false\n  cidr: 10.0.0.0/16\ncontroller:\n  amiHash: ami-1\n",
+		"controller no ami":    base + "network:\n  byo: false\n  cidr: 10.0.0.0/16\ncontroller:\n  instanceType: m7i.large\n",
+	}
+	for name, y := range cases {
+		t.Run(name, func(t *testing.T) {
+			if _, err := ParseCluster([]byte(y)); err == nil {
+				t.Errorf("expected validation error for %q", name)
+			}
+		})
+	}
+}
+
 func TestCluster_ContentHash_StableAndShaped(t *testing.T) {
 	c, _ := ParseCluster([]byte(goodCluster))
 	h1, err := c.ContentHash()

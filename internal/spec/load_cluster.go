@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 
 	"gopkg.in/yaml.v3"
@@ -43,6 +44,47 @@ func (c *Cluster) validate() error {
 	}
 	if c.Region == "" {
 		return fmt.Errorf("spec: cluster %q has empty region", c.Name)
+	}
+	if err := c.Network.validate(c.Name); err != nil {
+		return err
+	}
+	return c.Controller.validate(c.Name)
+}
+
+// validate checks the network spec: a bring-your-own network must name a VPC and
+// at least one subnet; a generated network must carry a parseable CIDR.
+func (n NetworkSpec) validate(cluster string) error {
+	if n.BYO {
+		if n.VPCID == "" {
+			return fmt.Errorf("spec: cluster %q network.byo=true but vpcId is empty", cluster)
+		}
+		if len(n.SubnetIDs) == 0 {
+			return fmt.Errorf("spec: cluster %q network.byo=true but subnetIds is empty", cluster)
+		}
+		return nil
+	}
+	if n.CIDR == "" {
+		return fmt.Errorf("spec: cluster %q network is generated (byo=false) but cidr is empty", cluster)
+	}
+	if _, _, err := net.ParseCIDR(n.CIDR); err != nil {
+		return fmt.Errorf("spec: cluster %q network.cidr %q is not a valid CIDR: %w", cluster, n.CIDR, err)
+	}
+	return nil
+}
+
+// validate checks the controller spec. An all-empty ControllerSpec means "no
+// controller this apply" (allowed during network-only bring-up); but if a
+// controller is requested at all, it must have an instance type and an
+// AMI-pinned image — a pet cannot launch without them (ARCHITECTURE §9).
+func (c ControllerSpec) validate(cluster string) error {
+	if c == (ControllerSpec{}) {
+		return nil // no controller requested
+	}
+	if c.InstanceType == "" {
+		return fmt.Errorf("spec: cluster %q controller requested but instanceType is empty", cluster)
+	}
+	if c.AMIHash == "" {
+		return fmt.Errorf("spec: cluster %q controller requested but amiHash is empty (the controller must be AMI-pinned)", cluster)
 	}
 	return nil
 }

@@ -65,6 +65,8 @@ func main() {
 func cmdApply() *cobra.Command {
 	var region, clusterYAML, workdir string
 	var scriptsBucket, manifestBucket, stateBucket, lockTable string
+	var adminCIDR string
+	var azCount int
 	var approve, dryRun bool
 	c := &cobra.Command{
 		Use:   "apply <layer>",
@@ -101,9 +103,14 @@ func cmdApply() *cobra.Command {
 				workdir = filepath.Join(".q0", "tofu", layer)
 			}
 
+			if adminCIDR == "0.0.0.0/0" {
+				fmt.Println("warning: --admin-cidr is 0.0.0.0/0 (controller SSH open to the world); set it to your admin range")
+			}
 			files, err := tofu.GenerateClusterFoundation(cl, tofu.FoundationOpts{
 				ScriptsBucket:  scriptsBucket,
 				ManifestBucket: manifestBucket,
+				AZCount:        azCount,
+				AdminCIDR:      adminCIDR,
 			})
 			if err != nil {
 				return err
@@ -113,10 +120,19 @@ func cmdApply() *cobra.Command {
 			}
 			hash, _ := cl.ContentHash()
 
+			netDesc := fmt.Sprintf("generated VPC %s across %d AZ(s)", cl.Network.CIDR, azCount)
+			if cl.Network.BYO {
+				netDesc = fmt.Sprintf("BYO VPC %s", cl.Network.VPCID)
+			}
+			ctlDesc := "no controller"
+			if cl.Controller.InstanceType != "" {
+				ctlDesc = fmt.Sprintf("controller %s (ami %s)", cl.Controller.InstanceType, cl.Controller.AMIHash)
+			}
+
 			if dryRun {
 				fmt.Printf("layer=cluster hash=%s region=%s workdir=%s\n", hash, region, workdir)
-				fmt.Printf("would provision: scripts bucket %q, manifest bucket %q, IAM instance profile q0-node, state backend %q/%q\n",
-					scriptsBucket, manifestBucket, stateBucket, lockTable)
+				fmt.Printf("would provision: %s; %s; scripts bucket %q, manifest bucket %q, IAM profile q0-node, state backend %q/%q\n",
+					netDesc, ctlDesc, scriptsBucket, manifestBucket, stateBucket, lockTable)
 				fmt.Println("rendered HCL written; no AWS touched (--dry-run)")
 				return nil
 			}
@@ -163,6 +179,8 @@ func cmdApply() *cobra.Command {
 	c.Flags().StringVar(&stateBucket, "state-bucket", "", "S3 bucket for tofu state (else $"+asbx.EnvStateBucket+")")
 	c.Flags().StringVar(&lockTable, "lock-table", "", "DynamoDB table for tofu state lock (else $"+asbx.EnvLockTable+")")
 	c.Flags().StringVar(&workdir, "workdir", "", "where generated HCL is written (default .q0/tofu/<layer>)")
+	c.Flags().IntVar(&azCount, "az-count", 2, "availability zones to spread a generated VPC across")
+	c.Flags().StringVar(&adminCIDR, "admin-cidr", "0.0.0.0/0", "source CIDR allowed to SSH the controller")
 	c.Flags().BoolVar(&approve, "approve", false, "apply the plan (default: plan only)")
 	c.Flags().BoolVar(&dryRun, "dry-run", false, "render HCL and print intent; touch no AWS or tofu")
 	return c
