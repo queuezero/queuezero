@@ -60,9 +60,9 @@ func (c *Cluster) validate() error {
 }
 
 // validateStorage checks each storage entry and rejects duplicate mount paths.
-// Kind is checked against the known set here; whether a Kind is *generatable*
-// yet (efs is, fsx-lustre is not) is the generator's call — the spec stays
-// liberal so a cluster.yaml is forward-compatible.
+// Kind is checked against the known set here; the fsx-lustre tuning fields
+// (capacity, deployment type) are validated when present. Both efs and
+// fsx-lustre are generatable.
 func (c *Cluster) validateStorage() error {
 	seen := make(map[string]struct{}, len(c.Storage))
 	for i, s := range c.Storage {
@@ -74,10 +74,36 @@ func (c *Cluster) validateStorage() error {
 		default:
 			return fmt.Errorf("spec: cluster %q storage[%d] has unknown kind %q (want efs|fsx-lustre)", c.Name, i, s.Kind)
 		}
+		if s.Kind == "fsx-lustre" {
+			if err := validateFSxLustre(c.Name, i, s); err != nil {
+				return err
+			}
+		}
 		if _, dup := seen[s.MountPath]; dup {
 			return fmt.Errorf("spec: cluster %q has duplicate storage mountPath %q", c.Name, s.MountPath)
 		}
 		seen[s.MountPath] = struct{}{}
+	}
+	return nil
+}
+
+// fsxDeploymentTypes is the set of FSx-Lustre deployment types AWS accepts.
+var fsxDeploymentTypes = map[string]struct{}{
+	"SCRATCH_1": {}, "SCRATCH_2": {}, "PERSISTENT_1": {}, "PERSISTENT_2": {},
+}
+
+// validateFSxLustre checks the optional fsx-lustre tuning fields. Empty fields
+// are allowed (the generator defaults them); set fields must be well-formed.
+func validateFSxLustre(cluster string, i int, s StorageSpec) error {
+	if s.DeploymentType != "" {
+		if _, ok := fsxDeploymentTypes[s.DeploymentType]; !ok {
+			return fmt.Errorf("spec: cluster %q storage[%d] fsx-lustre deploymentType %q is not one of "+
+				"SCRATCH_1|SCRATCH_2|PERSISTENT_1|PERSISTENT_2", cluster, i, s.DeploymentType)
+		}
+	}
+	if s.CapacityGiB != 0 && (s.CapacityGiB < 0 || s.CapacityGiB%1200 != 0) {
+		return fmt.Errorf("spec: cluster %q storage[%d] fsx-lustre capacityGiB %d must be a positive multiple of 1200",
+			cluster, i, s.CapacityGiB)
 	}
 	return nil
 }

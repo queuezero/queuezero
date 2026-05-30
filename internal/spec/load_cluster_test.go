@@ -97,9 +97,11 @@ func TestParseCluster_NetworkControllerValidation(t *testing.T) {
 func TestParseCluster_StorageValidation(t *testing.T) {
 	gen := "name: g\ncontrolAccount: \"1\"\nregion: us-east-1\nnetwork:\n  byo: false\n  cidr: 10.0.0.0/16\n"
 	cases := map[string]string{
-		"empty mountpath": gen + "storage:\n  - kind: efs\n",
-		"unknown kind":    gen + "storage:\n  - kind: nfs-classic\n    mountPath: /shared\n",
-		"dup mountpath":   gen + "storage:\n  - kind: efs\n    mountPath: /shared\n  - kind: fsx-lustre\n    mountPath: /shared\n",
+		"empty mountpath":     gen + "storage:\n  - kind: efs\n",
+		"unknown kind":        gen + "storage:\n  - kind: nfs-classic\n    mountPath: /shared\n",
+		"dup mountpath":       gen + "storage:\n  - kind: efs\n    mountPath: /shared\n  - kind: fsx-lustre\n    mountPath: /shared\n",
+		"bad fsx deploy type": gen + "storage:\n  - kind: fsx-lustre\n    mountPath: /scratch\n    deploymentType: SCRATCH_9\n",
+		"bad fsx capacity":    gen + "storage:\n  - kind: fsx-lustre\n    mountPath: /scratch\n    capacityGiB: 1000\n",
 	}
 	for name, y := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -111,6 +113,14 @@ func TestParseCluster_StorageValidation(t *testing.T) {
 	// A valid efs mount parses.
 	if _, err := ParseCluster([]byte(gen + "storage:\n  - kind: efs\n    mountPath: /shared\n")); err != nil {
 		t.Errorf("valid efs storage should pass: %v", err)
+	}
+	// A valid fsx-lustre mount parses — bare (generator defaults) and fully specified.
+	if _, err := ParseCluster([]byte(gen + "storage:\n  - kind: fsx-lustre\n    mountPath: /scratch\n")); err != nil {
+		t.Errorf("bare fsx-lustre storage should pass (generator defaults): %v", err)
+	}
+	full := gen + "storage:\n  - kind: fsx-lustre\n    mountPath: /scratch\n    capacityGiB: 2400\n    deploymentType: PERSISTENT_2\n    s3Linkage: s3://bucket/prefix\n"
+	if _, err := ParseCluster([]byte(full)); err != nil {
+		t.Errorf("fully specified fsx-lustre storage should pass: %v", err)
 	}
 }
 
