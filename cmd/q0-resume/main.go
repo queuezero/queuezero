@@ -19,7 +19,13 @@ import (
 
 func main() {
 	partition := flag.String("partition", "", "Slurm partition being resumed (else Q0_PARTITION / SLURM_RESUME_PARTITION / node-name match)")
+	strict := flag.Bool("strict", false, "fail closed on an admission-check error (else graceful: allow + warn)")
 	flag.Parse()
+
+	// --strict overrides the admission fail mode for this invocation.
+	if *strict {
+		_ = os.Setenv("Q0_ADMISSION_FAILMODE", "strict")
+	}
 
 	args := flag.Args()
 	if len(args) < 1 {

@@ -12,14 +12,31 @@ import (
 // internals and these fakes share scope. cohort's own fakes are unexported, so
 // the slurm domain needs its own — mirroring internal/mpi/domain_test.go.
 
+// fakeAdmitter is a programmable spend-rate gate.
+type fakeAdmitter struct {
+	allowed bool
+	reason  string
+	err     error
+	calls   int
+}
+
+func (a *fakeAdmitter) Admit(_ context.Context, _ AdmissionRequest) (AdmissionResult, error) {
+	a.calls++
+	if a.err != nil {
+		return AdmissionResult{}, a.err
+	}
+	return AdmissionResult{Allowed: a.allowed, Reason: a.reason}, nil
+}
+
 // fakeActuator launches entities, optionally failing specific ones, and records
 // terminate/stop calls for the suspend proof.
 type fakeActuator struct {
-	mu         sync.Mutex
-	failWith   map[cohort.EntityID]error // entity -> error from Launch
-	addresses  map[cohort.EntityID]string
-	terminated []cohort.EntityID
-	stopped    []cohort.EntityID
+	mu          sync.Mutex
+	failWith    map[cohort.EntityID]error // entity -> error from Launch
+	addresses   map[cohort.EntityID]string
+	launchedIDs []cohort.EntityID
+	terminated  []cohort.EntityID
+	stopped     []cohort.EntityID
 }
 
 func (a *fakeActuator) Launch(_ context.Context, intent cohort.EntityIntent) (cohort.Observation, error) {
@@ -28,10 +45,18 @@ func (a *fakeActuator) Launch(_ context.Context, intent cohort.EntityIntent) (co
 	if err, ok := a.failWith[intent.ID]; ok {
 		return cohort.Observation{}, err
 	}
+	a.launchedIDs = append(a.launchedIDs, intent.ID)
 	return cohort.Observation{
 		ID: intent.ID, Generation: intent.Generation, ProviderID: "i-" + string(intent.ID),
 		State: cohort.StateLaunching, Rung: intent.Rung, ObservedAt: time.Now(),
 	}, nil
+}
+
+// launched returns the entities Launch was called for (admission-gate proof).
+func (a *fakeActuator) launched() []cohort.EntityID {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return append([]cohort.EntityID(nil), a.launchedIDs...)
 }
 
 func (a *fakeActuator) Start(_ context.Context, id cohort.EntityID) (cohort.Observation, error) {

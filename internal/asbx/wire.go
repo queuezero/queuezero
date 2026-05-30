@@ -20,6 +20,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 
+	"github.com/queuezero/queuezero/internal/asbb"
 	"github.com/queuezero/queuezero/internal/cohort"
 	"github.com/queuezero/queuezero/internal/recordstore"
 	"github.com/queuezero/queuezero/internal/slurm"
@@ -41,6 +42,8 @@ const (
 	EnvStateBucket   = "Q0_STATE_BUCKET"
 	EnvLockTable     = "Q0_LOCK_TABLE"
 	EnvInstanceProfile = "Q0_INSTANCE_PROFILE_ARN"
+	EnvASBBEndpoint  = "Q0_ASBB_ENDPOINT"      // spend-rate admission service URL; empty = no gate
+	EnvFailMode      = "Q0_ADMISSION_FAILMODE" // graceful (default) | strict
 	EnvPartition     = "Q0_PARTITION"
 	envSlurmResumePartition = "SLURM_RESUME_PARTITION"
 
@@ -62,6 +65,11 @@ type Settings struct {
 	// so the bootstrap userdata shim can fetch the script-set from S3. Empty =>
 	// no profile attached.
 	InstanceProfileArn string
+	// ASBBEndpoint is the spend-rate admission service URL. Empty => no admission
+	// gate (resume proceeds without a budget check).
+	ASBBEndpoint string
+	// FailMode governs an admission-check error: "graceful" (default) or "strict".
+	FailMode string
 	// Partition is the partition name slurmctld is resuming/suspending, if known
 	// (from --partition or the Slurm/Q0 env). Empty => resolve by node name.
 	Partition string
@@ -87,6 +95,8 @@ func SettingsFromEnv(partitionFlag string) Settings {
 		BootstrapS3:        os.Getenv(EnvBootstrapS3),
 		ManifestBucket:     os.Getenv(EnvManifestBucket),
 		InstanceProfileArn: os.Getenv(EnvInstanceProfile),
+		ASBBEndpoint:       os.Getenv(EnvASBBEndpoint),
+		FailMode:           os.Getenv(EnvFailMode),
 		Partition:          partition,
 	}
 }
@@ -154,6 +164,17 @@ func BuildBridge(ctx context.Context, s Settings) (*slurm.Bridge, error) {
 		assembler = slurm.NewAssembler(awssub.NewS3Publisher(s3c, s.ManifestBucket))
 	}
 
+	// Spend-rate admission gate. Wire one only when an ASBB endpoint is
+	// configured; absent => Admitter nil => no gate (no regression).
+	var admitter slurm.Admitter
+	if s.ASBBEndpoint != "" {
+		admitter = asbb.NewClient(s.ASBBEndpoint)
+	}
+	failMode := s.FailMode
+	if failMode == "" {
+		failMode = slurm.FailGraceful
+	}
+
 	return &slurm.Bridge{
 		Reconciler: func(asm cohort.Assembler) *cohort.Reconciler {
 			return cohort.NewReconciler(act, obs, clf, enr, asm, lim)
@@ -163,6 +184,7 @@ func BuildBridge(ctx context.Context, s Settings) (*slurm.Bridge, error) {
 		Scontrol:  slurm.NewScontrol(),
 		Records:   store,
 		Describer: obs, // *Observer.DescribeCluster satisfies slurm.ClusterDescriber
+		Admitter:  admitter,
 		Cfg: slurm.Config{
 			Cluster:          s.Cluster,
 			Region:           s.Region,
@@ -170,6 +192,7 @@ func BuildBridge(ctx context.Context, s Settings) (*slurm.Bridge, error) {
 			Partitions:       parts,
 			DefaultPartition: s.Partition,
 			BootstrapS3:      s.BootstrapS3,
+			FailMode:         failMode,
 		},
 	}, nil
 }

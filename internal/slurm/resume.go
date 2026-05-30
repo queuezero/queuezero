@@ -25,6 +25,11 @@ type Config struct {
 	Partitions       *spec.Partitions  // loaded partitions.yaml
 	DefaultPartition string            // used when the invocation did not name a partition
 	BootstrapS3      string            // S3 location of the hash-pinned bootstrap script-set
+
+	// FailMode governs what an Admitter error means: FailGraceful (default —
+	// allow + warn, so a budget-service outage does not block the cluster) or
+	// FailStrict (refuse). Empty => graceful.
+	FailMode string
 }
 
 // Bridge holds the constructed ports the resume/suspend logic drives. The cmd
@@ -40,6 +45,7 @@ type Bridge struct {
 	Scontrol   Scontrol
 	Records    recordstore.Store
 	Describer  ClusterDescriber  // used by Sweep to enumerate cluster instances; nil disables sweep
+	Admitter   Admitter          // spend-rate gate at resume; nil disables admission (no gate)
 	Cfg        Config
 }
 
@@ -89,9 +95,26 @@ func (b *Bridge) Resume(ctx context.Context, partition, hostlist string) error {
 		return err
 	}
 
-	out, _ := b.Reconciler(asm).Reconcile(ctx, c)
+	// Spend-rate admission (ARCHITECTURE §1, §12): before launching anything, ask
+	// whether the project's budget admits this fleet. A refusal short-circuits the
+	// reconcile and marks the nodes down with a budget reason — the same legible
+	// path a capacity failure takes. Absent Admitter => no gate (feature off).
+	if b.Admitter != nil {
+		if refused, reason := b.checkAdmission(ctx, part, chain[0], len(nodes)); refused {
+			b.finish(ctx, recordRefusal(intents, cohortID, reason))
+			return nil
+		}
+	}
 
-	// Persist the Outcome so `q0 explain <node>` works after this process exits.
+	out, _ := b.Reconciler(asm).Reconcile(ctx, c)
+	b.finish(ctx, out)
+	return nil
+}
+
+// finish persists the Outcome (so `q0 explain <node>` works after this process
+// exits) and writes node state back to Slurm. Shared by the normal reconcile
+// path and the admission-refusal path.
+func (b *Bridge) finish(ctx context.Context, out cohort.Outcome) {
 	if b.Records != nil {
 		if err := b.Records.PutOutcome(out); err != nil {
 			// Non-fatal: legibility loss, not a launch failure. Surface it but
@@ -99,11 +122,52 @@ func (b *Bridge) Resume(ctx context.Context, partition, hostlist string) error {
 			fmt.Printf("slurm resume: persist outcome: %v\n", err)
 		}
 	}
-
 	// Immediate fast-fail writeback: mark failed nodes down/drain NOW rather than
 	// letting them sit in CF until ResumeTimeout (ARCHITECTURE §12).
 	b.writeback(ctx, out)
-	return nil
+}
+
+// checkAdmission consults the spend-rate gate. It returns (refused, reason).
+// An Admitter error is resolved by the configured fail mode: FailStrict refuses
+// (fail closed); FailGraceful (the default) allows with a warning — a budget
+// service outage must not block the whole cluster.
+func (b *Bridge) checkAdmission(ctx context.Context, part spec.Partition, rung cohort.Rung, count int) (bool, string) {
+	res, err := b.Admitter.Admit(ctx, AdmissionRequest{
+		Cluster:       b.Cfg.Cluster,
+		Partition:     part.Name,
+		Account:       part.ExecutionAccount,
+		InstanceType:  rung.InstanceType,
+		CapacityModel: capacityModelString(rung.CapacityModel),
+		Count:         count,
+		Region:        b.Cfg.Region,
+	})
+	if err != nil {
+		if b.Cfg.FailMode == FailStrict {
+			return true, fmt.Sprintf("admission check failed (strict): %v", err)
+		}
+		fmt.Printf("slurm resume: admission check failed, allowing (graceful): %v\n", err)
+		return false, ""
+	}
+	if !res.Allowed {
+		reason := res.Reason
+		if reason == "" {
+			reason = "budget exhausted"
+		}
+		return true, reason
+	}
+	return false, ""
+}
+
+// capacityModelString renders a cohort.CapacityModel for the admission request.
+func capacityModelString(m cohort.CapacityModel) string {
+	switch m {
+	case cohort.CapacitySpot:
+		return "spot"
+	case cohort.CapacityReserved:
+		return "reserved"
+	default:
+		return "ondemand"
+	}
 }
 
 // resolvePartition picks the Partition for this invocation: the explicit
