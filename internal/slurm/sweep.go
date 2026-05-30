@@ -116,6 +116,15 @@ func (b *Bridge) Sweep(ctx context.Context, opts SweepOptions) (SweepResult, err
 				if err := b.Actuator.Terminate(ctx, dec.Entity); err != nil {
 					// Best-effort: record the failure in the reason but keep going.
 					dec.Reason += fmt.Sprintf(" (terminate failed: %v)", err)
+				} else {
+					// Orphan reaped: close its budget hold (charge rate × runtime),
+					// the same reconcile the suspend path runs. Without this the
+					// node's hold is only released server-side by ASBB recovery,
+					// which charges nothing for the runtime the orphan consumed —
+					// an undercount. reconcileHold is best-effort: it logs and keeps
+					// the hold on failure for a later retry, and is a no-op when no
+					// hold is persisted or no Reconciler is wired.
+					b.reconcileHold(ctx, dec.Entity)
 				}
 			}
 			res.Reaped = append(res.Reaped, dec)
