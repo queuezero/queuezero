@@ -206,6 +206,27 @@ func TestActuator_Launch_DeliversMountSpec(t *testing.T) {
 	}
 }
 
+// When ActuatorConfig.ControllerHost is set, the baked userdata delivers
+// Q0_CONTROLLER_HOST to /etc/q0/mounts so the node's bootstrap.sh can point
+// slurmd at the controller.
+func TestActuator_Launch_DeliversControllerHost(t *testing.T) {
+	fake := &fakeSubstrateClient{}
+	cfg := testCfg()
+	cfg.ControllerHost = "10.0.1.42"
+	a := &Actuator{client: fake, cfg: cfg}
+
+	if _, err := a.Launch(context.Background(), testIntent("gpu-001")); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+	ud := fake.runReqs[0].UserData
+	if !strings.Contains(ud, "/etc/q0/mounts") {
+		t.Error("userdata should write the node-config file when ControllerHost is configured")
+	}
+	if !strings.Contains(ud, "Q0_CONTROLLER_HOST='10.0.1.42'") {
+		t.Errorf("userdata should carry the controller host; got:\n%s", ud)
+	}
+}
+
 func TestActuator_Launch_NoMounts_NoMountFile(t *testing.T) {
 	fake := &fakeSubstrateClient{}
 	a := newActuatorWithFake(fake) // testCfg has no Mounts

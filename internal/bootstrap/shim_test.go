@@ -47,6 +47,59 @@ func TestShim_WithMounts_WritesAndSourcesMountsFile(t *testing.T) {
 	}
 }
 
+func TestShim_WithControllerHost_WritesAndSourcesNodeFile(t *testing.T) {
+	p := validParams()
+	p.ControllerHost = "10.0.1.42"
+	out, err := Shim(p)
+	if err != nil {
+		t.Fatalf("Shim: %v", err)
+	}
+	for _, w := range []string{
+		"cat > /etc/q0/mounts",
+		"Q0_CONTROLLER_HOST='10.0.1.42'",
+		". /etc/q0/mounts",
+		"exec /opt/q0/bootstrap/bootstrap.sh",
+	} {
+		if !strings.Contains(out, w) {
+			t.Errorf("shim with controller host missing %q\n---\n%s", w, out)
+		}
+	}
+	// Controller host alone => no mount lines.
+	if strings.Contains(out, "Q0_MOUNT_SPEC") {
+		t.Error("controller host without mounts should not emit Q0_MOUNT_SPEC")
+	}
+	// The node-config file must be written BEFORE the exec.
+	if strings.Index(out, "/etc/q0/mounts") > strings.Index(out, "exec /opt/q0/bootstrap/bootstrap.sh") {
+		t.Error("node-config file must be written before exec-ing bootstrap.sh")
+	}
+}
+
+func TestShim_MountsAndControllerHost_BothDelivered(t *testing.T) {
+	p := validParams()
+	p.Mounts = []Mount{{DNS: "fs-0.efs.us-east-1.amazonaws.com", Path: "/shared"}}
+	p.ControllerHost = "10.0.1.42"
+	out, err := Shim(p)
+	if err != nil {
+		t.Fatalf("Shim: %v", err)
+	}
+	for _, w := range []string{
+		"Q0_MOUNT_SPEC='fs-0.efs.us-east-1.amazonaws.com:/shared'",
+		"Q0_MOUNT_PATHS='/shared'",
+		"Q0_CONTROLLER_HOST='10.0.1.42'",
+	} {
+		if !strings.Contains(out, w) {
+			t.Errorf("shim missing %q\n---\n%s", w, out)
+		}
+	}
+}
+
+func TestShim_NoMountsNoController_NoNodeFile(t *testing.T) {
+	out, _ := Shim(validParams())
+	if strings.Contains(out, MountsFile) || strings.Contains(out, "Q0_CONTROLLER_HOST") {
+		t.Error("neither mounts nor controller host => shim should not write the node-config file")
+	}
+}
+
 func TestShim_RendersFetchVerifyExec(t *testing.T) {
 	out, err := Shim(validParams())
 	if err != nil {
