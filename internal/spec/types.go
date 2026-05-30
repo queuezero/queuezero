@@ -34,7 +34,17 @@ type ControllerSpec struct {
 type StorageSpec struct {
 	Kind      string `yaml:"kind"` // fsx-lustre | efs | ...
 	MountPath string `yaml:"mountPath"`
+	// S3Linkage is the S3 data-repository path (e.g. "s3://bucket/prefix") for an
+	// fsx-lustre mount's Data Repository Association. Empty => no DRA. Ignored for efs.
 	S3Linkage string `yaml:"s3Linkage,omitempty"`
+	// CapacityGiB is the fsx-lustre filesystem size. The generator defaults it to
+	// 1200 (the FSx minimum) when 0; a non-zero value must be a positive multiple
+	// of 1200. Ignored for efs (EFS is elastic).
+	CapacityGiB int `yaml:"capacityGiB,omitempty"`
+	// DeploymentType is the fsx-lustre deployment type (SCRATCH_1|SCRATCH_2|
+	// PERSISTENT_1|PERSISTENT_2). The generator defaults it to SCRATCH_2 when empty.
+	// Ignored for efs.
+	DeploymentType string `yaml:"deploymentType,omitempty"`
 }
 
 // Partitions is partitions.yaml.

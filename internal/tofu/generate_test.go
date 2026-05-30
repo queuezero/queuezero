@@ -250,12 +250,96 @@ func TestGenerate_Storage_None(t *testing.T) {
 	}
 }
 
-// fsx-lustre is not yet generatable => GenerateClusterFoundation errors.
-func TestGenerate_Storage_FSxLustreErrors(t *testing.T) {
+func TestGenerate_Storage_FSxLustre(t *testing.T) {
 	c := testCluster()
-	c.Storage = []spec.StorageSpec{{Kind: "fsx-lustre", MountPath: "/scratch"}}
-	if _, err := GenerateClusterFoundation(c, FoundationOpts{ScriptsBucket: "b"}); err == nil {
-		t.Error("fsx-lustre should error (not yet implemented)")
+	c.Storage = []spec.StorageSpec{{Kind: "fsx-lustre", MountPath: "/scratch"}} // bare => generator defaults
+	files, err := GenerateClusterFoundation(c, FoundationOpts{ScriptsBucket: "b", AZCount: 2})
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	st := files["storage.tf"]
+	for _, w := range []string{
+		`resource "aws_security_group" "lustre"`,
+		`from_port       = 988`,
+		`from_port       = 1018`,
+		`to_port         = 1023`,
+		`resource "aws_fsx_lustre_file_system" "fsx_0"`,
+		`storage_capacity   = 1200`,    // default
+		`deployment_type    = "SCRATCH_2"`, // default
+		`subnet_ids         = [local.subnet_ids[0]]`,
+		`security_group_ids = [aws_security_group.lustre.id]`,
+	} {
+		if !strings.Contains(st, w) {
+			t.Errorf("storage.tf missing %q\n---\n%s", w, st)
+		}
+	}
+	// bare fsx => no DRA, no NFS SG (no efs entry).
+	if strings.Contains(st, "aws_fsx_data_repository_association") {
+		t.Error("no s3Linkage => no data repository association")
+	}
+	if strings.Contains(st, `resource "aws_security_group" "nfs"`) {
+		t.Error("no efs entry => no NFS security group")
+	}
+	out := files["outputs.tf"]
+	for _, w := range []string{"fsx_0_id", "fsx_0_dns", "fsx_0_mountname"} {
+		if !strings.Contains(out, w) {
+			t.Errorf("outputs.tf missing %q:\n%s", w, out)
+		}
+	}
+}
+
+func TestGenerate_Storage_FSxLustreWithDRA(t *testing.T) {
+	c := testCluster()
+	c.Storage = []spec.StorageSpec{{
+		Kind: "fsx-lustre", MountPath: "/scratch",
+		CapacityGiB: 2400, DeploymentType: "PERSISTENT_2", S3Linkage: "s3://bucket/prefix",
+	}}
+	files, err := GenerateClusterFoundation(c, FoundationOpts{ScriptsBucket: "b", AZCount: 2})
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	st := files["storage.tf"]
+	for _, w := range []string{
+		`storage_capacity   = 2400`,
+		`deployment_type    = "PERSISTENT_2"`,
+		`resource "aws_fsx_data_repository_association" "fsx_0"`,
+		`data_repository_path = "s3://bucket/prefix"`,
+		`file_system_path     = "/scratch"`,
+	} {
+		if !strings.Contains(st, w) {
+			t.Errorf("storage.tf missing %q\n---\n%s", w, st)
+		}
+	}
+}
+
+// A cluster with BOTH kinds renders both security groups and both resource sets.
+func TestGenerate_Storage_Mixed(t *testing.T) {
+	c := generatedWithController()
+	c.Controller.StateDir = "/shared/state"
+	c.Storage = []spec.StorageSpec{
+		{Kind: "efs", MountPath: "/shared"},
+		{Kind: "fsx-lustre", MountPath: "/scratch"},
+	}
+	files, err := GenerateClusterFoundation(c, FoundationOpts{ScriptsBucket: "b", AZCount: 2})
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	st := files["storage.tf"]
+	for _, w := range []string{
+		`resource "aws_security_group" "nfs"`,
+		`resource "aws_security_group" "lustre"`,
+		`resource "aws_efs_file_system" "efs_0"`,
+		`resource "aws_fsx_lustre_file_system" "fsx_1"`,
+	} {
+		if !strings.Contains(st, w) {
+			t.Errorf("mixed storage.tf missing %q\n---\n%s", w, st)
+		}
+	}
+	out := files["outputs.tf"]
+	for _, w := range []string{"efs_0_dns", "fsx_1_dns", "fsx_1_mountname"} {
+		if !strings.Contains(out, w) {
+			t.Errorf("mixed outputs.tf missing %q", w)
+		}
 	}
 }
 
