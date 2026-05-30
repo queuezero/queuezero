@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/queuezero/queuezero/internal/bootstrap"
 	"github.com/queuezero/queuezero/internal/cohort"
 	"github.com/queuezero/queuezero/internal/substrate"
 )
@@ -179,6 +180,40 @@ func TestActuator_Launch_BootstrapShimAndProfile(t *testing.T) {
 	}
 	if !strings.Contains(req.UserData, testBootstrapSHA) || !strings.Contains(req.UserData, "sha256sum -c") {
 		t.Errorf("shim should verify the content-address digest")
+	}
+}
+
+// When ActuatorConfig.Mounts is set, the baked userdata delivers the mount spec
+// to /etc/q0/mounts for the node's bootstrap.sh + q0-spored to consume.
+func TestActuator_Launch_DeliversMountSpec(t *testing.T) {
+	fake := &fakeSubstrateClient{}
+	cfg := testCfg()
+	cfg.Mounts = []bootstrap.Mount{{DNS: "fs-0.efs.us-east-1.amazonaws.com", Path: "/shared"}}
+	a := &Actuator{client: fake, cfg: cfg}
+
+	if _, err := a.Launch(context.Background(), testIntent("gpu-001")); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+	ud := fake.runReqs[0].UserData
+	if !strings.Contains(ud, "/etc/q0/mounts") {
+		t.Error("userdata should write the mounts file when Mounts is configured")
+	}
+	if !strings.Contains(ud, "fs-0.efs.us-east-1.amazonaws.com:/shared") {
+		t.Errorf("userdata should carry the mount spec; got:\n%s", ud)
+	}
+	if !strings.Contains(ud, "Q0_MOUNT_PATHS='/shared'") {
+		t.Error("userdata should set Q0_MOUNT_PATHS for spored")
+	}
+}
+
+func TestActuator_Launch_NoMounts_NoMountFile(t *testing.T) {
+	fake := &fakeSubstrateClient{}
+	a := newActuatorWithFake(fake) // testCfg has no Mounts
+	if _, err := a.Launch(context.Background(), testIntent("gpu-001")); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+	if strings.Contains(fake.runReqs[0].UserData, "/etc/q0/mounts") {
+		t.Error("no Mounts => no mounts file in userdata")
 	}
 }
 

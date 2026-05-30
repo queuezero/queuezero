@@ -55,6 +55,10 @@ type ActuatorConfig struct {
 	// Empty = no profile attached (the node cannot fetch from a private bucket).
 	// The profile itself is provisioned by the static substrate (OpenTofu).
 	InstanceProfileArn string
+
+	// Mounts is the shared-storage spec delivered to every launched node via the
+	// bootstrap shim (it writes /etc/q0/mounts). Empty = no mounts delivered.
+	Mounts []bootstrap.Mount
 }
 
 // substrateClient is the interface the Actuator and Observer program against.
@@ -120,6 +124,7 @@ func (a *Actuator) Launch(ctx context.Context, intent cohort.EntityIntent) (coho
 			S3URI:  a.cfg.DefaultBootstrapS3,
 			SHA256: sha,
 			Region: a.cfg.Region,
+			Mounts: a.cfg.Mounts,
 		})
 		if err != nil {
 			return cohort.Observation{}, fmt.Errorf("entity %s: %w", intent.ID, err)

@@ -13,6 +13,40 @@ func validParams() Params {
 	}
 }
 
+func TestShim_NoMounts_NoMountFile(t *testing.T) {
+	out, _ := Shim(validParams())
+	if strings.Contains(out, MountsFile) || strings.Contains(out, "Q0_MOUNT_SPEC") {
+		t.Error("no mounts => shim should not write the mounts file")
+	}
+}
+
+func TestShim_WithMounts_WritesAndSourcesMountsFile(t *testing.T) {
+	p := validParams()
+	p.Mounts = []Mount{
+		{DNS: "fs-0.efs.us-east-1.amazonaws.com", Path: "/shared"},
+		{DNS: "fs-1.efs.us-east-1.amazonaws.com", Path: "/scratch"},
+	}
+	out, err := Shim(p)
+	if err != nil {
+		t.Fatalf("Shim: %v", err)
+	}
+	for _, w := range []string{
+		"cat > /etc/q0/mounts",
+		"Q0_MOUNT_SPEC='fs-0.efs.us-east-1.amazonaws.com:/shared,fs-1.efs.us-east-1.amazonaws.com:/scratch'",
+		"Q0_MOUNT_PATHS='/shared,/scratch'",
+		". /etc/q0/mounts",
+		"exec /opt/q0/bootstrap/bootstrap.sh", // still execs the operator entrypoint after
+	} {
+		if !strings.Contains(out, w) {
+			t.Errorf("shim with mounts missing %q\n---\n%s", w, out)
+		}
+	}
+	// The mounts file must be written BEFORE the exec (delivered to the operator script).
+	if strings.Index(out, "/etc/q0/mounts") > strings.Index(out, "exec /opt/q0/bootstrap/bootstrap.sh") {
+		t.Error("mounts file must be written before exec-ing bootstrap.sh")
+	}
+}
+
 func TestShim_RendersFetchVerifyExec(t *testing.T) {
 	out, err := Shim(validParams())
 	if err != nil {

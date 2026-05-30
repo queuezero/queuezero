@@ -23,6 +23,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/feature/ec2/imds"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 
+	"github.com/queuezero/queuezero/internal/bootstrap"
 	"github.com/queuezero/queuezero/internal/spored"
 	"github.com/queuezero/queuezero/internal/substrate"
 	awssub "github.com/queuezero/queuezero/internal/substrate/aws"
@@ -72,11 +73,14 @@ func main() {
 
 // probesFromEnv builds the health probes from configuration:
 //   - Q0_MOUNT_PATHS: comma-separated mount points to verify (the dead-Lustre
-//     catch). Empty => no mount probe.
+//     catch). If unset, fall back to the Q0_MOUNT_PATHS line in the mounts file
+//     the bootstrap shim wrote (bootstrap.MountsFile, overridable via
+//     Q0_MOUNTS_FILE) — spored runs as its own systemd service and does not
+//     inherit the shim's process env, so the file is the reliable channel.
 //   - Q0_CHECK_SLURMD: "true" (default) adds the slurmd liveness probe.
 func probesFromEnv() []spored.Probe {
 	var probes []spored.Probe
-	for _, p := range strings.Split(os.Getenv("Q0_MOUNT_PATHS"), ",") {
+	for _, p := range strings.Split(mountPaths(), ",") {
 		if p = strings.TrimSpace(p); p != "" {
 			probes = append(probes, spored.MountProbe{Path: p})
 		}
@@ -85,4 +89,37 @@ func probesFromEnv() []spored.Probe {
 		probes = append(probes, spored.SlurmdProbe{})
 	}
 	return probes
+}
+
+// mountPaths resolves Q0_MOUNT_PATHS from the environment, else from the mounts
+// file the bootstrap shim wrote. Returns "" when neither is present.
+func mountPaths() string {
+	if v := os.Getenv("Q0_MOUNT_PATHS"); v != "" {
+		return v
+	}
+	path := os.Getenv("Q0_MOUNTS_FILE")
+	if path == "" {
+		path = bootstrap.MountsFile
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	return parseMountPathsLine(string(data))
+}
+
+// parseMountPathsLine extracts the value of a Q0_MOUNT_PATHS='...' line from the
+// sourceable env file the shim wrote. Pure, so it is unit-testable.
+func parseMountPathsLine(content string) string {
+	for _, line := range strings.Split(content, "\n") {
+		line = strings.TrimSpace(line)
+		const prefix = "Q0_MOUNT_PATHS="
+		if !strings.HasPrefix(line, prefix) {
+			continue
+		}
+		v := strings.TrimPrefix(line, prefix)
+		v = strings.Trim(v, `'"`) // shim quotes the value
+		return v
+	}
+	return ""
 }

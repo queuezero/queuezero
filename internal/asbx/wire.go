@@ -21,6 +21,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 
 	"github.com/queuezero/queuezero/internal/asbb"
+	"github.com/queuezero/queuezero/internal/bootstrap"
 	"github.com/queuezero/queuezero/internal/cohort"
 	"github.com/queuezero/queuezero/internal/recordstore"
 	"github.com/queuezero/queuezero/internal/slurm"
@@ -43,6 +44,7 @@ const (
 	EnvLockTable     = "Q0_LOCK_TABLE"
 	EnvInstanceProfile = "Q0_INSTANCE_PROFILE_ARN"
 	EnvControllerHost = "Q0_CONTROLLER_HOST"   // slurmctld host (controller private IP); consumed by resume/suspend (later)
+	EnvMountSpec     = "Q0_MOUNT_SPEC"         // shared-storage spec "dns:path,..." delivered to launched nodes
 	EnvASBBEndpoint  = "Q0_ASBB_ENDPOINT"      // spend-rate admission service URL; empty = no gate
 	EnvFailMode      = "Q0_ADMISSION_FAILMODE" // graceful (default) | strict
 	EnvPartition     = "Q0_PARTITION"
@@ -74,6 +76,9 @@ type Settings struct {
 	// ControllerHost is the slurmctld host (controller private IP), produced by
 	// `q0 apply` and consumed by the resume/suspend side (a later phase).
 	ControllerHost string
+	// MountSpec is the shared-storage spec ("dns:path,...") produced by `q0 apply`
+	// and delivered to launched nodes via the bootstrap shim. Empty => no mounts.
+	MountSpec string
 	// Partition is the partition name slurmctld is resuming/suspending, if known
 	// (from --partition or the Slurm/Q0 env). Empty => resolve by node name.
 	Partition string
@@ -102,6 +107,7 @@ func SettingsFromEnv(partitionFlag string) Settings {
 		ASBBEndpoint:       os.Getenv(EnvASBBEndpoint),
 		FailMode:           os.Getenv(EnvFailMode),
 		ControllerHost:     os.Getenv(EnvControllerHost),
+		MountSpec:          os.Getenv(EnvMountSpec),
 		Partition:          partition,
 	}
 }
@@ -148,6 +154,7 @@ func BuildBridge(ctx context.Context, s Settings) (*slurm.Bridge, error) {
 		Region:             s.Region,
 		DefaultBootstrapS3: s.BootstrapS3,
 		InstanceProfileArn: s.InstanceProfileArn,
+		Mounts:             bootstrap.ParseMountSpec(s.MountSpec),
 	}
 	act := awssub.NewActuator(client, actCfg)
 	obs := awssub.NewObserver(client, actCfg)

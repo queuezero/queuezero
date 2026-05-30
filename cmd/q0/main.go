@@ -172,7 +172,7 @@ func cmdApply() *cobra.Command {
 				if err != nil {
 					return err
 				}
-				printApplyEnv(out)
+				printApplyEnv(cl, out)
 				return nil
 			}
 
@@ -190,7 +190,7 @@ func cmdApply() *cobra.Command {
 			}
 			fmt.Printf("layer=cluster hash=%s applied\n", hash)
 			if out, oerr := ex.Output(cmd.Context(), workdir); oerr == nil {
-				printApplyEnv(out)
+				printApplyEnv(cl, out)
 			}
 			return nil
 		},
@@ -214,17 +214,19 @@ func cmdApply() *cobra.Command {
 // from a layer's tofu outputs, so the operator can `eval "$(q0 apply cluster
 // --show-env)"` instead of hand-pinning each value. EFS DNS names are printed as
 // informational comments (mount wiring is a later phase).
-func printApplyEnv(out map[string]string) {
+func printApplyEnv(cl *spec.Cluster, out map[string]string) {
 	fmt.Println("# pin these into the resume/suspend environment:")
-	for _, line := range applyEnvLines(out) {
+	for _, line := range applyEnvLines(cl, out) {
 		fmt.Println(line)
 	}
 }
 
 // applyEnvLines maps known tofu output names to the Q0_* env they feed and
 // returns the lines to print, in a stable order. Pure (no I/O) so it is
-// table-testable. Unknown/absent outputs are omitted; EFS DNS becomes a comment.
-func applyEnvLines(out map[string]string) []string {
+// table-testable. Unknown/absent outputs are omitted. EFS outputs are zipped
+// with the cluster's Storage mount paths (by index) into Q0_MOUNT_SPEC, which
+// the resume side delivers to launched nodes.
+func applyEnvLines(cl *spec.Cluster, out map[string]string) []string {
 	var lines []string
 	add := func(env, key string) {
 		if v := out[key]; v != "" {
@@ -235,13 +237,21 @@ func applyEnvLines(out map[string]string) []string {
 	add(asbx.EnvScriptsBucket, "scripts_bucket")
 	add(asbx.EnvManifestBucket, "manifest_bucket")
 	add(asbx.EnvControllerHost, "controller_private_ip")
-	// EFS mounts: informational only — mount wiring is a later phase.
-	for i := 0; ; i++ {
-		dns, ok := out[fmt.Sprintf("efs_%d_dns", i)]
-		if !ok || dns == "" {
-			break
+
+	// Q0_MOUNT_SPEC: zip cluster.yaml Storage (mount path, by list index) with the
+	// tofu efs_<i>_dns outputs (2i indexes efs entries by their Storage position).
+	var mounts []bootstrap.Mount
+	if cl != nil {
+		for i, s := range cl.Storage {
+			dns := out[fmt.Sprintf("efs_%d_dns", i)]
+			if dns == "" || s.MountPath == "" {
+				continue // non-efs entry, or output missing — skip
+			}
+			mounts = append(mounts, bootstrap.Mount{DNS: dns, Path: s.MountPath})
 		}
-		lines = append(lines, fmt.Sprintf("# efs_%d = %s (mount target — wiring deferred)", i, dns))
+	}
+	if spec := bootstrap.FormatMountSpec(mounts); spec != "" {
+		lines = append(lines, fmt.Sprintf("export %s=%s", asbx.EnvMountSpec, spec))
 	}
 	return lines
 }
