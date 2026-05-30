@@ -41,9 +41,9 @@ require (
 )
 
 // --- queuezero ecosystem -----------------------------------------------------
-// These are integrated as the build progresses; pin exact module paths and
-// versions in CLAUDE.md once confirmed. They are deliberately NOT required yet
-// so the scaffold builds clean:
+// These are integrated as the build progresses; the module paths and versions
+// below are the confirmed pins. They are deliberately NOT required yet so the
+// scaffold builds clean:
 //
 //   ASBX  github.com/scttfrdmn/aws-slurm-burst         v0.4.0 — Slurm resume/suspend bridge (embed as lib)
 //   ASBA  github.com/scttfrdmn/aws-slurm-burst-advisor v0.3.0 — capacity fallback-chain advisor

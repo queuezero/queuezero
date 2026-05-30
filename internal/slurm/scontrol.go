@@ -12,9 +12,9 @@ import (
 // It is an interface so the resume/suspend logic is testable without a real
 // Slurm controller.
 //
-// Shelling `scontrol` does NOT violate the "link, don't shell" rule (CLAUDE.md
-// non-negotiable #7): that rule governs spore.host PROVIDER tools, where a
-// classified error must arrive as a Go value rather than parsed stderr.
+// Shelling `scontrol` does NOT violate the "link, don't shell" rule: that rule
+// governs spore.host PROVIDER tools, where a classified error must arrive as a
+// Go value rather than parsed stderr.
 // `scontrol` is Slurm's own CLI and the documented runtime seam (ARCHITECTURE
 // §11) — it carries no provider-error classification, only hostlist expansion
 // and node-state writes. Keeping it behind this interface makes it the single
