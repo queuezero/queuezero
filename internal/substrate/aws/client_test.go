@@ -38,6 +38,13 @@ type fakeEC2 struct {
 	createTagsErr      error
 	createTagsResource string            // last Resources[0]
 	createTagsSeen     map[string]string // last tags written
+
+	// preflight read responses
+	offerings []ec2types.InstanceTypeOffering
+	images    []ec2types.Image
+	subnets   []ec2types.Subnet
+	zones     []ec2types.AvailabilityZone
+	readErr   error // injected on any preflight Describe*
 }
 
 type runResponse struct {
@@ -114,6 +121,34 @@ func (f *fakeEC2) CreateTags(_ context.Context, in *ec2.CreateTagsInput, _ ...fu
 		f.createTagsSeen[awssdk.ToString(t.Key)] = awssdk.ToString(t.Value)
 	}
 	return &ec2.CreateTagsOutput{}, nil
+}
+
+func (f *fakeEC2) DescribeInstanceTypeOfferings(_ context.Context, _ *ec2.DescribeInstanceTypeOfferingsInput, _ ...func(*ec2.Options)) (*ec2.DescribeInstanceTypeOfferingsOutput, error) {
+	if f.readErr != nil {
+		return nil, f.readErr
+	}
+	return &ec2.DescribeInstanceTypeOfferingsOutput{InstanceTypeOfferings: f.offerings}, nil
+}
+
+func (f *fakeEC2) DescribeImages(_ context.Context, _ *ec2.DescribeImagesInput, _ ...func(*ec2.Options)) (*ec2.DescribeImagesOutput, error) {
+	if f.readErr != nil {
+		return nil, f.readErr
+	}
+	return &ec2.DescribeImagesOutput{Images: f.images}, nil
+}
+
+func (f *fakeEC2) DescribeSubnets(_ context.Context, _ *ec2.DescribeSubnetsInput, _ ...func(*ec2.Options)) (*ec2.DescribeSubnetsOutput, error) {
+	if f.readErr != nil {
+		return nil, f.readErr
+	}
+	return &ec2.DescribeSubnetsOutput{Subnets: f.subnets}, nil
+}
+
+func (f *fakeEC2) DescribeAvailabilityZones(_ context.Context, _ *ec2.DescribeAvailabilityZonesInput, _ ...func(*ec2.Options)) (*ec2.DescribeAvailabilityZonesOutput, error) {
+	if f.readErr != nil {
+		return nil, f.readErr
+	}
+	return &ec2.DescribeAvailabilityZonesOutput{AvailabilityZones: f.zones}, nil
 }
 
 // ---- helpers ----------------------------------------------------------------
@@ -390,6 +425,48 @@ func TestClient_RunInstance_NoUserData(t *testing.T) {
 	}
 	if fake.lastUserData != "" {
 		t.Errorf("expected no userdata, got %q", fake.lastUserData)
+	}
+}
+
+// The preflight read methods map fake EC2 responses to provider-agnostic answers.
+func TestClient_PreflightReads(t *testing.T) {
+	ctx := context.Background()
+
+	offered := newClient(&fakeEC2{offerings: []ec2types.InstanceTypeOffering{{}}})
+	if ok, err := offered.InstanceTypeOffered(ctx, "p5.48xlarge", "us-east-1a"); err != nil || !ok {
+		t.Errorf("offered: ok=%v err=%v want true,nil", ok, err)
+	}
+	none := newClient(&fakeEC2{}) // no offerings
+	if ok, _ := none.InstanceTypeOffered(ctx, "p5.48xlarge", "us-east-1f"); ok {
+		t.Error("no offerings => not offered")
+	}
+
+	img := newClient(&fakeEC2{images: []ec2types.Image{{}}})
+	if ok, _ := img.ImageExists(ctx, "ami-1"); !ok {
+		t.Error("image present => exists")
+	}
+	if ok, _ := none.ImageExists(ctx, "ami-missing"); ok {
+		t.Error("no images => not exists")
+	}
+
+	sn := newClient(&fakeEC2{subnets: []ec2types.Subnet{{}}})
+	if ok, _ := sn.SubnetExists(ctx, "subnet-1"); !ok {
+		t.Error("subnet present => exists")
+	}
+
+	azc := newClient(&fakeEC2{zones: []ec2types.AvailabilityZone{
+		{ZoneName: awssdk.String("us-east-1a")}, {ZoneName: awssdk.String("us-east-1b")},
+	}})
+	zs, err := azc.AvailabilityZones(ctx)
+	if err != nil || len(zs) != 2 || zs[0] != "us-east-1a" {
+		t.Errorf("AvailabilityZones = %v, %v", zs, err)
+	}
+}
+
+func TestClient_PreflightReads_ErrorSurfaces(t *testing.T) {
+	c := newClient(&fakeEC2{readErr: errors.New("UnauthorizedOperation")})
+	if _, err := c.InstanceTypeOffered(context.Background(), "t3.micro", "us-east-1a"); err == nil {
+		t.Error("read error should surface")
 	}
 }
 

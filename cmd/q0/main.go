@@ -7,6 +7,7 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -15,15 +16,18 @@ import (
 
 	awssdkconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
+	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/spf13/cobra"
 
 	"github.com/queuezero/queuezero/internal/asbx"
 	"github.com/queuezero/queuezero/internal/bootstrap"
 	"github.com/queuezero/queuezero/internal/cohort"
+	"github.com/queuezero/queuezero/internal/preflight"
 	"github.com/queuezero/queuezero/internal/recordstore"
 	"github.com/queuezero/queuezero/internal/slurm"
 	"github.com/queuezero/queuezero/internal/spec"
+	"github.com/queuezero/queuezero/internal/substrate"
 	awssub "github.com/queuezero/queuezero/internal/substrate/aws"
 	"github.com/queuezero/queuezero/internal/tofu"
 )
@@ -271,13 +275,71 @@ func firstNonEmpty(vals ...string) string {
 // Failing in 10 seconds instead of 20 minutes is most of the felt difference
 // from ParallelCluster.
 func cmdPreflight() *cobra.Command {
-	return &cobra.Command{
+	var clusterYAML, partitionsYAML, region string
+	c := &cobra.Command{
 		Use:   "preflight",
-		Short: "verify quotas, IAM, capacity offerings and compatibility — no mutation",
-		RunE: func(*cobra.Command, []string) error {
-			return fmt.Errorf("not yet implemented — see docs/ARCHITECTURE.md §12")
+		Short: "verify capacity offerings, AMI, subnets — read-only, no mutation",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			if clusterYAML == "" {
+				clusterYAML = "cluster.yaml"
+			}
+			cl, err := spec.LoadCluster(clusterYAML)
+			if err != nil {
+				return err
+			}
+			// partitions.yaml is optional: absent => cluster-layer checks only.
+			var parts *spec.Partitions
+			if partitionsYAML == "" {
+				partitionsYAML = "partitions.yaml"
+			}
+			if p, perr := spec.LoadPartitions(partitionsYAML); perr == nil {
+				parts = p
+			} else if !os.IsNotExist(errUnwrapPath(perr)) {
+				return perr // a real parse/validation error, not just "absent"
+			}
+
+			if region == "" {
+				region = firstNonEmpty(cl.Region, os.Getenv(asbx.EnvRegion))
+			}
+			if region == "" {
+				return fmt.Errorf("no region: set cluster.yaml region, --region, or %s", asbx.EnvRegion)
+			}
+
+			awsCfg, err := awssdkconfig.LoadDefaultConfig(cmd.Context(), awssdkconfig.WithRegion(region))
+			if err != nil {
+				return fmt.Errorf("load AWS config: %w", err)
+			}
+			checker := awssub.NewClient(ec2.NewFromConfig(awsCfg), substrate.NewLimiter(substrate.LimiterConfig{}, nil))
+
+			rep, err := preflight.Run(cmd.Context(), cl, parts, checker)
+			if err != nil {
+				return err
+			}
+			for _, r := range rep.Results {
+				status := "OK  "
+				if !r.OK {
+					status = "FAIL"
+				}
+				fmt.Printf("%s  %-22s %-28s %s\n", status, r.Check, r.Target, r.Detail)
+			}
+			if !rep.OK() {
+				return fmt.Errorf("preflight: one or more checks failed")
+			}
+			fmt.Println("preflight: all checks passed")
+			return nil
 		},
 	}
+	c.Flags().StringVar(&clusterYAML, "file", "", "path to cluster.yaml (default ./cluster.yaml)")
+	c.Flags().StringVar(&partitionsYAML, "partitions", "", "path to partitions.yaml (default ./partitions.yaml; absent => cluster checks only)")
+	c.Flags().StringVar(&region, "region", "", "AWS region (else cluster.yaml region / $"+asbx.EnvRegion+")")
+	return c
+}
+
+// errUnwrapPath returns the underlying *os.PathError-style error so os.IsNotExist
+// can see a "file not found" through spec.LoadPartitions's %w wrapping.
+func errUnwrapPath(err error) error {
+	return errors.Unwrap(err)
 }
 
 func cmdImport() *cobra.Command {

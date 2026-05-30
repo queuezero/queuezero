@@ -204,6 +204,69 @@ func (c *Client) Tag(ctx context.Context, providerID string, kv map[string]strin
 	return nil
 }
 
+// ---- read-only preflight checks (no mutation) -------------------------------
+// Each returns a provider-agnostic answer so internal/preflight need not import
+// the AWS SDK. All go through the rate limiter + classifier like every other call.
+
+// InstanceTypeOffered reports whether instanceType is offered in availability
+// zone az (DescribeInstanceTypeOfferings with an availability-zone location).
+func (c *Client) InstanceTypeOffered(ctx context.Context, instanceType, az string) (bool, error) {
+	if err := c.limiter.Acquire(ctx); err != nil {
+		return false, err
+	}
+	out, err := c.ec2.DescribeInstanceTypeOfferings(ctx, &ec2.DescribeInstanceTypeOfferingsInput{
+		LocationType: ec2types.LocationTypeAvailabilityZone,
+		Filters: []ec2types.Filter{
+			{Name: awssdk.String("instance-type"), Values: []string{instanceType}},
+			{Name: awssdk.String("location"), Values: []string{az}},
+		},
+	})
+	if err != nil {
+		return false, faultErr(c.clf.Classify(err))
+	}
+	return len(out.InstanceTypeOfferings) > 0, nil
+}
+
+// ImageExists reports whether an AMI id resolves to an image in this region.
+func (c *Client) ImageExists(ctx context.Context, ami string) (bool, error) {
+	if err := c.limiter.Acquire(ctx); err != nil {
+		return false, err
+	}
+	out, err := c.ec2.DescribeImages(ctx, &ec2.DescribeImagesInput{ImageIds: []string{ami}})
+	if err != nil {
+		return false, faultErr(c.clf.Classify(err))
+	}
+	return len(out.Images) > 0, nil
+}
+
+// SubnetExists reports whether a subnet id resolves in this region/account.
+func (c *Client) SubnetExists(ctx context.Context, subnetID string) (bool, error) {
+	if err := c.limiter.Acquire(ctx); err != nil {
+		return false, err
+	}
+	out, err := c.ec2.DescribeSubnets(ctx, &ec2.DescribeSubnetsInput{SubnetIds: []string{subnetID}})
+	if err != nil {
+		return false, faultErr(c.clf.Classify(err))
+	}
+	return len(out.Subnets) > 0, nil
+}
+
+// AvailabilityZones lists the available AZ names for this region.
+func (c *Client) AvailabilityZones(ctx context.Context) ([]string, error) {
+	if err := c.limiter.Acquire(ctx); err != nil {
+		return nil, err
+	}
+	out, err := c.ec2.DescribeAvailabilityZones(ctx, &ec2.DescribeAvailabilityZonesInput{})
+	if err != nil {
+		return nil, faultErr(c.clf.Classify(err))
+	}
+	zones := make([]string, 0, len(out.AvailabilityZones))
+	for _, z := range out.AvailabilityZones {
+		zones = append(zones, awssdk.ToString(z.ZoneName))
+	}
+	return zones, nil
+}
+
 // DescribeByTag returns instances matching all provided tag key=value pairs.
 // Results are ADVISORY and eventually consistent (B5): a miss on a freshly
 // launched instance is StateUnknown, not StateAbsent. The idempotency token
