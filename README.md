@@ -45,8 +45,7 @@ q0 explain     show the structured reconciliation trace for an entity
 | `internal/capture` | the introspect→spec backend behind `import` and `capture` |
 | `internal/slurm` | the Slurm/MPI domain layer + the ASBX resume/suspend bridge |
 
-See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full design and
-[`CLAUDE.md`](CLAUDE.md) for build conventions.
+See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full design.
 
 ## Build
 
