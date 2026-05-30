@@ -53,3 +53,13 @@ See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full design.
 make build     # -> bin/q0
 make check     # vet + cohort import guard + tests
 ```
+
+## Tracking & releases
+
+Progress is tracked entirely in GitHub — [issues](https://github.com/queuezero/queuezero/issues),
+[milestones](https://github.com/queuezero/queuezero/milestones), and the project board — not in
+in-repo status files. Contributions follow an issues/PRs-only workflow (no direct pushes to `main`).
+
+Releases follow [Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html); user-facing
+changes are recorded in [`CHANGELOG.md`](CHANGELOG.md) per
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
