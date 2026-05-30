@@ -37,8 +37,32 @@ type AdmissionRequest struct {
 type AdmissionResult struct {
 	Allowed         bool
 	Reason          string  // human-readable, surfaced via q0 explain on refusal
-	EstimatedCost   float64 // what the budget service estimated for this fleet
+	EstimatedCost   float64 // the budget service's estimate ($/hr for a fleet hold)
 	BudgetRemaining float64
+	// TransactionID is the hold the budget service placed for this fleet. It is
+	// empty when the gate places no hold (e.g. a graceful-degradation allow). The
+	// resume path persists it so the matching suspend can reconcile the hold
+	// against actuals (the other half of the spend-rate loop).
+	TransactionID string
+}
+
+// Reconciler closes a resume-time hold against actual cost at teardown. It is an
+// OPTIONAL capability: Suspend uses it only when the configured Admitter also
+// implements it (type assertion), so a plain Admitter is unaffected. Like the
+// admission request it is fleet-shaped — actual cost is rate × runtime, computed
+// from the persisted hold and the node's run duration.
+type Reconciler interface {
+	Reconcile(ctx context.Context, req ReconcileRequest) error
+}
+
+// ReconcileRequest closes one hold. ActualCost is the realized charge
+// (rate × runtime hours); the budget service converts the hold to a charge and
+// refunds the variance.
+type ReconcileRequest struct {
+	TransactionID string
+	Account       string
+	JobID         string  // a synthetic id for the fleet teardown (entity + generation)
+	ActualCost    float64
 }
 
 // Fail modes for an Admitter error (the gate could not reach a verdict).

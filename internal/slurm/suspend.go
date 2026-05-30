@@ -50,7 +50,12 @@ func (b *Bridge) Suspend(ctx context.Context, partition, hostlist string) error 
 		}
 		if aerr != nil {
 			errs = append(errs, fmt.Errorf("%s: %w", node, aerr))
+			continue
 		}
+		// Teardown succeeded: close this node's resume-time budget hold against
+		// actuals. Best-effort and never blocks teardown (a reconcile failure is a
+		// budget-drift risk handled by ASBB recovery, not a suspend failure).
+		b.reconcileHold(ctx, id)
 	}
 
 	// The generation-tagged orphan sweeper — the backstop for a missed Terminate
@@ -64,6 +69,56 @@ func (b *Bridge) Suspend(ctx context.Context, partition, hostlist string) error 
 		return fmt.Errorf("slurm suspend: %d node(s) failed: %w", len(errs), errors.Join(errs...))
 	}
 	return nil
+}
+
+// reconcileHold closes the resume-time hold for one torn-down node. It looks up
+// the persisted hold, computes actual cost as rate × runtime (the rate-
+// reservation semantics the gate held against), asks the budget service to
+// reconcile, and removes the hold. Every step is best-effort: a missing hold,
+// no reconcile-capable Admitter, or a service error is logged and swallowed so
+// teardown is never blocked.
+func (b *Bridge) reconcileHold(ctx context.Context, id cohort.EntityID) {
+	if b.Holds == nil {
+		return
+	}
+	h, err := b.Holds.Get(id)
+	if err != nil {
+		if !errors.Is(err, ErrNoHold) {
+			fmt.Printf("slurm suspend: read hold for %s: %v\n", id, err)
+		}
+		return // no hold => nothing to reconcile
+	}
+
+	// Reconcile is an optional Admitter capability; without it we can still drop
+	// the local hold (the service-side hold stays until ASBB recovery sweeps it).
+	rec, ok := b.Admitter.(Reconciler)
+	if !ok {
+		if err := b.Holds.Delete(id); err != nil {
+			fmt.Printf("slurm suspend: delete hold for %s: %v\n", id, err)
+		}
+		return
+	}
+
+	runtimeHours := nowFunc().Sub(h.StartedAt).Hours()
+	if runtimeHours < 0 {
+		runtimeHours = 0
+	}
+	actualCost := h.HourlyRate * runtimeHours
+
+	req := ReconcileRequest{
+		TransactionID: h.TransactionID,
+		Account:       h.Account,
+		JobID:         fmt.Sprintf("%s/%s", b.Cfg.Cluster, id),
+		ActualCost:    actualCost,
+	}
+	if err := rec.Reconcile(ctx, req); err != nil {
+		// Leave the local hold in place so a later sweep/retry can try again.
+		fmt.Printf("slurm suspend: reconcile hold %s for %s: %v\n", h.TransactionID, id, err)
+		return
+	}
+	if err := b.Holds.Delete(id); err != nil {
+		fmt.Printf("slurm suspend: delete hold for %s: %v\n", id, err)
+	}
 }
 
 // suspendAction maps a partition's warm-pool spec to a stop mode (or terminate).

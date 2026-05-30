@@ -14,10 +14,12 @@ import (
 
 // fakeAdmitter is a programmable spend-rate gate.
 type fakeAdmitter struct {
-	allowed bool
-	reason  string
-	err     error
-	calls   int
+	allowed       bool
+	reason        string
+	err           error
+	transactionID string  // returned on the allow path
+	estimatedCost float64 // whole-fleet $/hr
+	calls         int
 }
 
 func (a *fakeAdmitter) Admit(_ context.Context, _ AdmissionRequest) (AdmissionResult, error) {
@@ -25,7 +27,37 @@ func (a *fakeAdmitter) Admit(_ context.Context, _ AdmissionRequest) (AdmissionRe
 	if a.err != nil {
 		return AdmissionResult{}, a.err
 	}
-	return AdmissionResult{Allowed: a.allowed, Reason: a.reason}, nil
+	return AdmissionResult{
+		Allowed:       a.allowed,
+		Reason:        a.reason,
+		TransactionID: a.transactionID,
+		EstimatedCost: a.estimatedCost,
+	}, nil
+}
+
+// fakeReconcilingAdmitter is a fakeAdmitter that also satisfies Reconciler,
+// recording the reconcile requests it received.
+type fakeReconcilingAdmitter struct {
+	fakeAdmitter
+	mu         sync.Mutex
+	reconciles []ReconcileRequest
+	reconErr   error
+}
+
+func (a *fakeReconcilingAdmitter) Reconcile(_ context.Context, req ReconcileRequest) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.reconErr != nil {
+		return a.reconErr
+	}
+	a.reconciles = append(a.reconciles, req)
+	return nil
+}
+
+func (a *fakeReconcilingAdmitter) recorded() []ReconcileRequest {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return append([]ReconcileRequest(nil), a.reconciles...)
 }
 
 // fakeActuator launches entities, optionally failing specific ones, and records

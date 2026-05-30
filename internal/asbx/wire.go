@@ -177,10 +177,18 @@ func BuildBridge(ctx context.Context, s Settings) (*slurm.Bridge, error) {
 	}
 
 	// Spend-rate admission gate. Wire one only when an ASBB endpoint is
-	// configured; absent => Admitter nil => no gate (no regression).
+	// configured; absent => Admitter nil => no gate (no regression). The same
+	// client also satisfies slurm.Reconciler (closes holds at suspend), and we
+	// wire a hold store so resume-time holds survive to the stateless suspend.
 	var admitter slurm.Admitter
+	var holds slurm.HoldStore
 	if s.ASBBEndpoint != "" {
 		admitter = asbb.NewClient(s.ASBBEndpoint)
+		hs, herr := slurm.NewFileHoldStore(filepath.Join(s.StateDir, "holds"))
+		if herr != nil {
+			return nil, herr
+		}
+		holds = hs
 	}
 	failMode := s.FailMode
 	if failMode == "" {
@@ -197,6 +205,7 @@ func BuildBridge(ctx context.Context, s Settings) (*slurm.Bridge, error) {
 		Records:   store,
 		Describer: obs, // *Observer.DescribeCluster satisfies slurm.ClusterDescriber
 		Admitter:  admitter,
+		Holds:     holds,
 		Cfg: slurm.Config{
 			Cluster:          s.Cluster,
 			Region:           s.Region,
