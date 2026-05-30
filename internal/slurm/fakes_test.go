@@ -65,6 +65,7 @@ func (a *fakeReconcilingAdmitter) recorded() []ReconcileRequest {
 type fakeActuator struct {
 	mu          sync.Mutex
 	failWith    map[cohort.EntityID]error // entity -> error from Launch
+	termFail    map[cohort.EntityID]error // entity -> error from Terminate (nil map => all succeed)
 	addresses   map[cohort.EntityID]string
 	launchedIDs []cohort.EntityID
 	terminated  []cohort.EntityID
@@ -105,6 +106,9 @@ func (a *fakeActuator) Stop(_ context.Context, id cohort.EntityID, _ cohort.Stop
 func (a *fakeActuator) Terminate(_ context.Context, id cohort.EntityID) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if err, ok := a.termFail[id]; ok {
+		return err // record nothing: the instance is still running
+	}
 	a.terminated = append(a.terminated, id)
 	return nil
 }
