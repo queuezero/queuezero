@@ -45,6 +45,13 @@ type Params struct {
 	// can mount/verify. The shim itself performs NO mount (still §11/#9 — it only
 	// delivers the spec to a known path).
 	Mounts []Mount
+	// ControllerHost is the slurmctld host (controller private IP) delivered to
+	// the node so the operator's bootstrap.sh can set slurmd's SlurmctldHost /
+	// --conf-server and register with the controller. When non-empty the shim
+	// writes Q0_CONTROLLER_HOST into the same /etc/q0/mounts node-config file.
+	// The shim performs NO slurmd config (still §11/#9 — it only delivers the
+	// value to a known path).
+	ControllerHost string
 }
 
 // MountsFile is the well-known path the shim writes the mount spec to and that
@@ -58,6 +65,7 @@ const defaultLogPath = "/var/log/q0-bootstrap.log"
 type shimData struct {
 	S3URI, SHA256, Region, LogPath string
 	MountsFile, MountSpec, MountPaths string
+	ControllerHost                    string
 }
 
 // shimTemplate is the rendered userdata. It is deliberately tiny and contains no
@@ -83,14 +91,16 @@ echo "{{.SHA256}}  /tmp/q0-bootstrap.tar.gz" | sha256sum -c -
 
 tar -xzf /tmp/q0-bootstrap.tar.gz -C /opt/q0/bootstrap
 touch "$SENTINEL"
-{{if .MountSpec}}
-# Deliver the shared-storage spec for bootstrap.sh + q0-spored to consume. The
-# shim does NOT mount — it only writes the known location (§11/#9).
+{{if or .MountSpec .ControllerHost}}
+# Deliver node config (shared-storage spec, controller host) for bootstrap.sh +
+# q0-spored to consume. The shim does NOT mount or configure slurmd — it only
+# writes the known location (§11/#9).
 mkdir -p /etc/q0
 cat > {{.MountsFile}} <<'Q0_MOUNTS_EOF'
-Q0_MOUNT_SPEC='{{.MountSpec}}'
+{{if .MountSpec}}Q0_MOUNT_SPEC='{{.MountSpec}}'
 Q0_MOUNT_PATHS='{{.MountPaths}}'
-Q0_MOUNTS_EOF
+{{end}}{{if .ControllerHost}}Q0_CONTROLLER_HOST='{{.ControllerHost}}'
+{{end}}Q0_MOUNTS_EOF
 . {{.MountsFile}}
 {{end}}
 echo "q0-bootstrap: executing entrypoint"
@@ -118,9 +128,10 @@ func Shim(p Params) (string, error) {
 		SHA256:     p.SHA256,
 		Region:     p.Region,
 		LogPath:    p.LogPath,
-		MountsFile: MountsFile,
-		MountSpec:  FormatMountSpec(p.Mounts),
-		MountPaths: MountPaths(p.Mounts),
+		MountsFile:     MountsFile,
+		MountSpec:      FormatMountSpec(p.Mounts),
+		MountPaths:     MountPaths(p.Mounts),
+		ControllerHost: p.ControllerHost,
 	}
 
 	var b strings.Builder

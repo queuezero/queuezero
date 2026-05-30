@@ -59,6 +59,12 @@ type ActuatorConfig struct {
 	// Mounts is the shared-storage spec delivered to every launched node via the
 	// bootstrap shim (it writes /etc/q0/mounts). Empty = no mounts delivered.
 	Mounts []bootstrap.Mount
+
+	// ControllerHost is the slurmctld host (controller private IP) delivered to
+	// every launched node via the bootstrap shim (written into /etc/q0/mounts as
+	// Q0_CONTROLLER_HOST), so the operator's bootstrap.sh can point slurmd at the
+	// controller. Empty = not delivered. Produced by `q0 apply` (Q0_CONTROLLER_HOST).
+	ControllerHost string
 }
 
 // substrateClient is the interface the Actuator and Observer program against.
@@ -121,10 +127,11 @@ func (a *Actuator) Launch(ctx context.Context, intent cohort.EntityIntent) (coho
 			return cohort.Observation{}, fmt.Errorf("entity %s: %w", intent.ID, err)
 		}
 		shim, err := bootstrap.Shim(bootstrap.Params{
-			S3URI:  a.cfg.DefaultBootstrapS3,
-			SHA256: sha,
-			Region: a.cfg.Region,
-			Mounts: a.cfg.Mounts,
+			S3URI:          a.cfg.DefaultBootstrapS3,
+			SHA256:         sha,
+			Region:         a.cfg.Region,
+			Mounts:         a.cfg.Mounts,
+			ControllerHost: a.cfg.ControllerHost,
 		})
 		if err != nil {
 			return cohort.Observation{}, fmt.Errorf("entity %s: %w", intent.ID, err)

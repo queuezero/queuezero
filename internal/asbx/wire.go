@@ -43,7 +43,7 @@ const (
 	EnvStateBucket   = "Q0_STATE_BUCKET"
 	EnvLockTable     = "Q0_LOCK_TABLE"
 	EnvInstanceProfile = "Q0_INSTANCE_PROFILE_ARN"
-	EnvControllerHost = "Q0_CONTROLLER_HOST"   // slurmctld host (controller private IP); consumed by resume/suspend (later)
+	EnvControllerHost = "Q0_CONTROLLER_HOST"   // slurmctld host (controller private IP); delivered to launched nodes via the bootstrap shim
 	EnvMountSpec     = "Q0_MOUNT_SPEC"         // shared-storage spec "dns:path,..." delivered to launched nodes
 	EnvASBBEndpoint  = "Q0_ASBB_ENDPOINT"      // spend-rate admission service URL; empty = no gate
 	EnvFailMode      = "Q0_ADMISSION_FAILMODE" // graceful (default) | strict
@@ -155,6 +155,7 @@ func BuildBridge(ctx context.Context, s Settings) (*slurm.Bridge, error) {
 		DefaultBootstrapS3: s.BootstrapS3,
 		InstanceProfileArn: s.InstanceProfileArn,
 		Mounts:             bootstrap.ParseMountSpec(s.MountSpec),
+		ControllerHost:     s.ControllerHost,
 	}
 	act := awssub.NewActuator(client, actCfg)
 	obs := awssub.NewObserver(client, actCfg)
