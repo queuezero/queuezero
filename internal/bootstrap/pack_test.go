@@ -88,6 +88,53 @@ func TestPack_RoundTripContainsEntrypointExecutable(t *testing.T) {
 	}
 }
 
+// TestPack_ReferenceScriptSet packs the real scripts/bootstrap reference set so
+// it can never silently rot: it must stay packable (contains an executable
+// bootstrap.sh entrypoint) and deterministic. This wires the shell artifact into
+// `make check`.
+func TestPack_ReferenceScriptSet(t *testing.T) {
+	dir := filepath.Join("..", "..", "scripts", "bootstrap")
+	if _, err := os.Stat(filepath.Join(dir, Entrypoint)); err != nil {
+		t.Fatalf("reference script-set missing %s: %v", Entrypoint, err)
+	}
+
+	var a, b bytes.Buffer
+	d1, err := Pack(dir, &a)
+	if err != nil {
+		t.Fatalf("Pack reference set: %v", err)
+	}
+	d2, err := Pack(dir, &b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d1 != d2 {
+		t.Errorf("reference set digest is non-deterministic: %s vs %s", d1, d2)
+	}
+
+	// bootstrap.sh must be present and executable in the tarball.
+	gz, err := gzip.NewReader(&a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr := tar.NewReader(gz)
+	foundExec := false
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if hdr.Name == Entrypoint {
+			foundExec = hdr.Mode&0o100 != 0
+		}
+	}
+	if !foundExec {
+		t.Error("reference scripts/bootstrap/bootstrap.sh missing or not executable in the tarball")
+	}
+}
+
 func TestPack_MissingEntrypoint(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "other.sh"), []byte("x"), 0o644); err != nil {
