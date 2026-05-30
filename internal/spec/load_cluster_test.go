@@ -20,6 +20,8 @@ controller:
   accountingDb: gauss.rds.amazonaws.com
   amiHash: ami-deadbeef
 storage:
+  - kind: efs
+    mountPath: /shared
   - kind: fsx-lustre
     mountPath: /scratch
 `
@@ -35,7 +37,7 @@ func TestParseCluster_Good(t *testing.T) {
 	if !c.Network.BYO || len(c.Network.SubnetIDs) != 2 {
 		t.Errorf("network not parsed: %+v", c.Network)
 	}
-	if c.Controller.AMIHash != "ami-deadbeef" || len(c.Storage) != 1 {
+	if c.Controller.AMIHash != "ami-deadbeef" || len(c.Storage) != 2 {
 		t.Errorf("controller/storage not parsed: %+v", c)
 	}
 }
@@ -89,6 +91,50 @@ func TestParseCluster_NetworkControllerValidation(t *testing.T) {
 				t.Errorf("expected validation error for %q", name)
 			}
 		})
+	}
+}
+
+func TestParseCluster_StorageValidation(t *testing.T) {
+	gen := "name: g\ncontrolAccount: \"1\"\nregion: us-east-1\nnetwork:\n  byo: false\n  cidr: 10.0.0.0/16\n"
+	cases := map[string]string{
+		"empty mountpath": gen + "storage:\n  - kind: efs\n",
+		"unknown kind":    gen + "storage:\n  - kind: nfs-classic\n    mountPath: /shared\n",
+		"dup mountpath":   gen + "storage:\n  - kind: efs\n    mountPath: /shared\n  - kind: fsx-lustre\n    mountPath: /shared\n",
+	}
+	for name, y := range cases {
+		t.Run(name, func(t *testing.T) {
+			if _, err := ParseCluster([]byte(y)); err == nil {
+				t.Errorf("expected validation error for %q", name)
+			}
+		})
+	}
+	// A valid efs mount parses.
+	if _, err := ParseCluster([]byte(gen + "storage:\n  - kind: efs\n    mountPath: /shared\n")); err != nil {
+		t.Errorf("valid efs storage should pass: %v", err)
+	}
+}
+
+func TestParseCluster_StateDirInvariant(t *testing.T) {
+	base := func(stateDir, storage string) string {
+		return "name: g\ncontrolAccount: \"1\"\nregion: us-east-1\n" +
+			"network:\n  byo: false\n  cidr: 10.0.0.0/16\n" +
+			"controller:\n  instanceType: m7i.large\n  amiHash: ami-1\n  stateDir: " + stateDir + "\n" + storage
+	}
+	// StateDir under a declared efs mount: OK.
+	if _, err := ParseCluster([]byte(base("/shared/state", "storage:\n  - kind: efs\n    mountPath: /shared\n"))); err != nil {
+		t.Errorf("stateDir under a declared mount should pass: %v", err)
+	}
+	// StateDir not under any mount: error.
+	if _, err := ParseCluster([]byte(base("/var/lib/slurm", "storage:\n  - kind: efs\n    mountPath: /shared\n"))); err == nil {
+		t.Error("stateDir not under a declared mount should error")
+	}
+	// Controller with StateDir but no storage at all: error (would land on ephemeral EBS).
+	if _, err := ParseCluster([]byte(base("/shared/state", ""))); err == nil {
+		t.Error("controller stateDir with no declared storage should error")
+	}
+	// A sibling-prefix mount must NOT count (/shared-x is not under /shared).
+	if _, err := ParseCluster([]byte(base("/shared-x/state", "storage:\n  - kind: efs\n    mountPath: /shared\n"))); err == nil {
+		t.Error("/shared-x must not be treated as under /shared")
 	}
 }
 

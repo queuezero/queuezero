@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -48,7 +50,63 @@ func (c *Cluster) validate() error {
 	if err := c.Network.validate(c.Name); err != nil {
 		return err
 	}
-	return c.Controller.validate(c.Name)
+	if err := c.validateStorage(); err != nil {
+		return err
+	}
+	if err := c.Controller.validate(c.Name); err != nil {
+		return err
+	}
+	return c.validateStateDir()
+}
+
+// validateStorage checks each storage entry and rejects duplicate mount paths.
+// Kind is checked against the known set here; whether a Kind is *generatable*
+// yet (efs is, fsx-lustre is not) is the generator's call — the spec stays
+// liberal so a cluster.yaml is forward-compatible.
+func (c *Cluster) validateStorage() error {
+	seen := make(map[string]struct{}, len(c.Storage))
+	for i, s := range c.Storage {
+		if s.MountPath == "" {
+			return fmt.Errorf("spec: cluster %q storage[%d] has empty mountPath", c.Name, i)
+		}
+		switch s.Kind {
+		case "efs", "fsx-lustre":
+		default:
+			return fmt.Errorf("spec: cluster %q storage[%d] has unknown kind %q (want efs|fsx-lustre)", c.Name, i, s.Kind)
+		}
+		if _, dup := seen[s.MountPath]; dup {
+			return fmt.Errorf("spec: cluster %q has duplicate storage mountPath %q", c.Name, s.MountPath)
+		}
+		seen[s.MountPath] = struct{}{}
+	}
+	return nil
+}
+
+// validateStateDir enforces the §9 durability invariant: the controller's Slurm
+// save-state dir must live on declared shared storage, never on the controller's
+// ephemeral instance disk. A controller with no StateDir is allowed (dev/degenerate).
+func (c *Cluster) validateStateDir() error {
+	if c.Controller.InstanceType == "" || c.Controller.StateDir == "" {
+		return nil
+	}
+	for _, s := range c.Storage {
+		if underMount(c.Controller.StateDir, s.MountPath) {
+			return nil
+		}
+	}
+	return fmt.Errorf("spec: cluster %q controller stateDir %q must live under a declared shared-storage mountPath (ARCHITECTURE §9)",
+		c.Name, c.Controller.StateDir)
+}
+
+// underMount reports whether path is at or below mount (path-prefix on a
+// path-segment boundary), so /shared/state is under /shared but /shared-x is not.
+func underMount(path, mount string) bool {
+	path = filepath.Clean(path)
+	mount = filepath.Clean(mount)
+	if path == mount {
+		return true
+	}
+	return strings.HasPrefix(path, mount+string(filepath.Separator))
 }
 
 // validate checks the network spec: a bring-your-own network must name a VPC and

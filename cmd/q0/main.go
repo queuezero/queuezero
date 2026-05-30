@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	awssdkconfig "github.com/aws/aws-sdk-go-v2/config"
@@ -128,11 +129,19 @@ func cmdApply() *cobra.Command {
 			if cl.Controller.InstanceType != "" {
 				ctlDesc = fmt.Sprintf("controller %s (ami %s)", cl.Controller.InstanceType, cl.Controller.AMIHash)
 			}
+			stDesc := "no shared storage"
+			if len(cl.Storage) > 0 {
+				parts := make([]string, 0, len(cl.Storage))
+				for _, s := range cl.Storage {
+					parts = append(parts, fmt.Sprintf("%s at %s", s.Kind, s.MountPath))
+				}
+				stDesc = strings.Join(parts, ", ")
+			}
 
 			if dryRun {
 				fmt.Printf("layer=cluster hash=%s region=%s workdir=%s\n", hash, region, workdir)
-				fmt.Printf("would provision: %s; %s; scripts bucket %q, manifest bucket %q, IAM profile q0-node, state backend %q/%q\n",
-					netDesc, ctlDesc, scriptsBucket, manifestBucket, stateBucket, lockTable)
+				fmt.Printf("would provision: %s; %s; storage: %s; scripts bucket %q, manifest bucket %q, IAM profile q0-node, state backend %q/%q\n",
+					netDesc, ctlDesc, stDesc, scriptsBucket, manifestBucket, stateBucket, lockTable)
 				fmt.Println("rendered HCL written; no AWS touched (--dry-run)")
 				return nil
 			}

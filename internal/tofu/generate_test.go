@@ -35,6 +35,14 @@ func byoCluster() *spec.Cluster {
 	}
 }
 
+// withStorage: generated network + controller whose StateDir lives on a declared efs mount.
+func withStorage() *spec.Cluster {
+	c := generatedWithController()
+	c.Controller.StateDir = "/shared/state"
+	c.Storage = []spec.StorageSpec{{Kind: "efs", MountPath: "/shared"}}
+	return c
+}
+
 func TestGenerateClusterFoundation_RendersExpectedResources(t *testing.T) {
 	files, err := GenerateClusterFoundation(testCluster(), FoundationOpts{
 		ScriptsBucket:  "gauss-q0-scripts",
@@ -90,8 +98,9 @@ func TestGenerateClusterFoundation_RequiresScriptsBucket(t *testing.T) {
 
 func TestGenerateClusterFoundation_Deterministic(t *testing.T) {
 	o := FoundationOpts{ScriptsBucket: "b", ManifestBucket: "m"}
-	a, _ := GenerateClusterFoundation(testCluster(), o)
-	b, _ := GenerateClusterFoundation(testCluster(), o)
+	// Exercise the full template set, including storage, for determinism.
+	a, _ := GenerateClusterFoundation(withStorage(), o)
+	b, _ := GenerateClusterFoundation(withStorage(), o)
 	for name := range a {
 		if a[name] != b[name] {
 			t.Errorf("%s render is non-deterministic", name)
@@ -198,6 +207,55 @@ func TestGenerate_ControllerAbsent(t *testing.T) {
 	}
 	if strings.Contains(files["outputs.tf"], "controller_private_ip") {
 		t.Error("no controller => no controller output")
+	}
+}
+
+// EFS storage renders the file system + per-AZ mount targets + the NFS SG + outputs.
+func TestGenerate_Storage_EFS(t *testing.T) {
+	files, err := GenerateClusterFoundation(withStorage(), FoundationOpts{ScriptsBucket: "b", AZCount: 2})
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	st := files["storage.tf"]
+	for _, w := range []string{
+		`resource "aws_security_group" "nfs"`,
+		`from_port       = 2049`,
+		`security_groups = [aws_security_group.compute.id]`,
+		`security_groups = [aws_security_group.controller.id]`,
+		`resource "aws_efs_file_system" "efs_0"`,
+		`encrypted      = true`,
+		`creation_token = "gauss-efs-0"`,
+		`resource "aws_efs_mount_target" "efs_0"`,
+		`count           = 2`,
+		`subnet_id       = local.subnet_ids[count.index]`,
+	} {
+		if !strings.Contains(st, w) {
+			t.Errorf("storage.tf missing %q", w)
+		}
+	}
+	out := files["outputs.tf"]
+	if !strings.Contains(out, "efs_0_id") || !strings.Contains(out, "efs_0_dns") {
+		t.Errorf("outputs.tf missing efs outputs:\n%s", out)
+	}
+}
+
+// No storage declared => storage.tf has no resources.
+func TestGenerate_Storage_None(t *testing.T) {
+	files, _ := GenerateClusterFoundation(testCluster(), FoundationOpts{ScriptsBucket: "b"})
+	if strings.Contains(files["storage.tf"], `resource "aws_efs`) {
+		t.Error("no storage => no efs resources")
+	}
+	if strings.Contains(files["outputs.tf"], "efs_0_id") {
+		t.Error("no storage => no efs outputs")
+	}
+}
+
+// fsx-lustre is not yet generatable => GenerateClusterFoundation errors.
+func TestGenerate_Storage_FSxLustreErrors(t *testing.T) {
+	c := testCluster()
+	c.Storage = []spec.StorageSpec{{Kind: "fsx-lustre", MountPath: "/scratch"}}
+	if _, err := GenerateClusterFoundation(c, FoundationOpts{ScriptsBucket: "b"}); err == nil {
+		t.Error("fsx-lustre should error (not yet implemented)")
 	}
 }
 
