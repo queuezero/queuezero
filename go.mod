@@ -3,7 +3,7 @@ module github.com/queuezero/queuezero
 go 1.26
 
 // Direct dependencies pinned for the scaffold.
-require github.com/spf13/cobra v1.8.1
+require github.com/spf13/cobra v1.10.2
 
 require (
 	github.com/aws/aws-sdk-go-v2 v1.41.9
@@ -13,6 +13,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/ec2 v1.303.0
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.102.2
 	github.com/aws/smithy-go v1.26.0
+	github.com/spore-host/truffle v0.36.2
 	golang.org/x/sync v0.20.0
 	gopkg.in/yaml.v3 v3.0.1
 )
@@ -28,12 +29,15 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/internal/endpoint-discovery v1.12.2 // indirect
 	github.com/aws/aws-sdk-go-v2/service/internal/presigned-url v1.13.25 // indirect
 	github.com/aws/aws-sdk-go-v2/service/internal/s3shared v1.19.25 // indirect
+	github.com/aws/aws-sdk-go-v2/service/pricing v1.42.2 // indirect
+	github.com/aws/aws-sdk-go-v2/service/servicequotas v1.34.7 // indirect
 	github.com/aws/aws-sdk-go-v2/service/signin v1.1.0 // indirect
 	github.com/aws/aws-sdk-go-v2/service/sso v1.30.18 // indirect
 	github.com/aws/aws-sdk-go-v2/service/ssooidc v1.36.1 // indirect
 	github.com/aws/aws-sdk-go-v2/service/sts v1.42.2 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
-	github.com/spf13/pflag v1.0.5 // indirect
+	github.com/spf13/pflag v1.0.10 // indirect
+	github.com/spore-host/libs v0.35.0 // indirect
 )
 
 // --- queuezero ecosystem -----------------------------------------------------

@@ -29,6 +29,20 @@ func (f fakeChecker) InstanceTypeOffered(_ context.Context, it, az string) (bool
 func (f fakeChecker) ImageExists(_ context.Context, ami string) (bool, error) { return f.images[ami], nil }
 func (f fakeChecker) SubnetExists(_ context.Context, id string) (bool, error) { return f.subnets[id], nil }
 
+// fakeQuotaChecker adds the optional QuotaChecker capability over fakeChecker.
+type fakeQuotaChecker struct {
+	fakeChecker
+	quotaOK map[string]bool // "type@az" -> within quota
+}
+
+func (f fakeQuotaChecker) ServiceQuotaOK(_ context.Context, it, az, _ string) (bool, string, error) {
+	ok := f.quotaOK[it+"@"+az]
+	if ok {
+		return true, "within family quota", nil
+	}
+	return false, "family vCPU quota exceeded", nil
+}
+
 func cluster() *spec.Cluster {
 	return &spec.Cluster{
 		Name: "gauss", Region: "us-east-1",
@@ -122,5 +136,55 @@ func TestRun_AZListingError(t *testing.T) {
 	c := fakeChecker{azErr: errors.New("AuthFailure")}
 	if _, err := Run(context.Background(), cluster(), partitions(), c); err == nil {
 		t.Error("AZ listing failure should return an error (checks could not run)")
+	}
+}
+
+// A plain Checker (no quota capability) emits no service-quota Results.
+func TestRun_NoQuotaCapability_Skipped(t *testing.T) {
+	c := fakeChecker{
+		zones:   []string{"us-east-1a", "us-east-1b"},
+		offered: map[string]bool{"p5.48xlarge@us-east-1a": true, "p5.48xlarge@us-east-1b": true},
+		images:  map[string]bool{"ami-1": true},
+		subnets: map[string]bool{"subnet-1": true},
+	}
+	rep, _ := Run(context.Background(), cluster(), partitions(), c)
+	for _, r := range rep.Results {
+		if r.Check == "service-quota" {
+			t.Error("plain Checker must not produce service-quota Results")
+		}
+	}
+}
+
+// A QuotaChecker drives service-quota Results: within-quota passes, over-quota fails.
+func TestRun_QuotaChecker(t *testing.T) {
+	base := fakeChecker{
+		zones:   []string{"us-east-1a", "us-east-1b"},
+		offered: map[string]bool{"p5.48xlarge@us-east-1a": true, "p5.48xlarge@us-east-1b": true},
+		images:  map[string]bool{"ami-1": true},
+		subnets: map[string]bool{"subnet-1": true},
+	}
+	// 1a within quota, 1b over quota.
+	c := fakeQuotaChecker{fakeChecker: base, quotaOK: map[string]bool{"p5.48xlarge@us-east-1a": true}}
+
+	rep, err := Run(context.Background(), cluster(), partitions(), c)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if rep.OK() {
+		t.Fatal("expected the over-quota rung to fail the report")
+	}
+	var pass, fail int
+	for _, r := range rep.Results {
+		if r.Check != "service-quota" {
+			continue
+		}
+		if r.OK {
+			pass++
+		} else {
+			fail++
+		}
+	}
+	if pass != 1 || fail != 1 {
+		t.Errorf("want 1 quota pass + 1 quota fail, got pass=%d fail=%d", pass, fail)
 	}
 }

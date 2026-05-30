@@ -24,6 +24,7 @@ import (
 	"github.com/queuezero/queuezero/internal/bootstrap"
 	"github.com/queuezero/queuezero/internal/cohort"
 	"github.com/queuezero/queuezero/internal/preflight"
+	"github.com/queuezero/queuezero/internal/preflight/truffleck"
 	"github.com/queuezero/queuezero/internal/recordstore"
 	"github.com/queuezero/queuezero/internal/slurm"
 	"github.com/queuezero/queuezero/internal/spec"
@@ -276,9 +277,10 @@ func firstNonEmpty(vals ...string) string {
 // from ParallelCluster.
 func cmdPreflight() *cobra.Command {
 	var clusterYAML, partitionsYAML, region string
+	var noQuota bool
 	c := &cobra.Command{
 		Use:   "preflight",
-		Short: "verify capacity offerings, AMI, subnets — read-only, no mutation",
+		Short: "verify capacity offerings, AMI, subnets, Service Quotas — read-only, no mutation",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if clusterYAML == "" {
@@ -310,7 +312,14 @@ func cmdPreflight() *cobra.Command {
 			if err != nil {
 				return fmt.Errorf("load AWS config: %w", err)
 			}
-			checker := awssub.NewClient(ec2.NewFromConfig(awsCfg), substrate.NewLimiter(substrate.LimiterConfig{}, nil))
+			// The truffle-backed checker covers the four EC2 reads AND the
+			// Service-Quota verdict. --no-quota hides the quota capability (the
+			// substrate client alone), so preflight.Run runs EC2 checks only —
+			// the escape hatch when credentials can't reach servicequotas.
+			var checker preflight.Checker = truffleck.New(awsCfg, region)
+			if noQuota {
+				checker = awssub.NewClient(ec2.NewFromConfig(awsCfg), substrate.NewLimiter(substrate.LimiterConfig{}, nil))
+			}
 
 			rep, err := preflight.Run(cmd.Context(), cl, parts, checker)
 			if err != nil {
@@ -333,6 +342,7 @@ func cmdPreflight() *cobra.Command {
 	c.Flags().StringVar(&clusterYAML, "file", "", "path to cluster.yaml (default ./cluster.yaml)")
 	c.Flags().StringVar(&partitionsYAML, "partitions", "", "path to partitions.yaml (default ./partitions.yaml; absent => cluster checks only)")
 	c.Flags().StringVar(&region, "region", "", "AWS region (else cluster.yaml region / $"+asbx.EnvRegion+")")
+	c.Flags().BoolVar(&noQuota, "no-quota", false, "skip Service-Quota checks (EC2-only; use when credentials can't reach servicequotas)")
 	return c
 }
 

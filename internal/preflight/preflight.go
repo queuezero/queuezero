@@ -31,6 +31,16 @@ type Checker interface {
 	AvailabilityZones(ctx context.Context) ([]string, error)
 }
 
+// QuotaChecker is an OPTIONAL capability: a Checker that can also answer whether
+// the account's Service Quotas admit an instance type. Run uses it only when the
+// supplied Checker implements it (type assertion), so a plain 4-method Checker —
+// and the EC2-only path — is unaffected. The implementation owns the
+// instance-type→vCPU and family→quota-code mapping (the truffle adapter does);
+// the core only consumes ok + a human-readable detail.
+type QuotaChecker interface {
+	ServiceQuotaOK(ctx context.Context, instanceType, az, capacityModel string) (ok bool, detail string, err error)
+}
+
 // Result is one check's verdict, in the decision+reason style used elsewhere
 // (cf. slurm.SweepDecision). Detail is human-readable and surfaced by the CLI.
 type Result struct {
@@ -103,7 +113,11 @@ func Run(ctx context.Context, cl *spec.Cluster, parts *spec.Partitions, c Checke
 		}
 	}
 
-	// Every partition fallback rung: AZ valid + instance type offered there.
+	// Quota checks are an optional capability — only when the Checker provides it.
+	qc, hasQuota := c.(QuotaChecker)
+
+	// Every partition fallback rung: AZ valid + instance type offered there
+	// (+ Service Quota, if the Checker supports it).
 	if parts != nil {
 		for _, p := range parts.Partitions {
 			for _, r := range p.FallbackChain {
@@ -127,6 +141,17 @@ func Run(ctx context.Context, cl *spec.Cluster, parts *spec.Partitions, c Checke
 						fmt.Sprintf("partition %q: offered", p.Name),
 						fmt.Sprintf("partition %q: instance type not offered in this AZ", p.Name)),
 				})
+
+				if hasQuota {
+					qok, detail, qerr := qc.ServiceQuotaOK(ctx, r.InstanceType, r.AvailZone, r.CapacityModel)
+					if qerr != nil {
+						return rep, fmt.Errorf("preflight: service quota %s: %w", target, qerr)
+					}
+					rep.Results = append(rep.Results, Result{
+						Check: "service-quota", Target: target, OK: qok,
+						Detail: fmt.Sprintf("partition %q: %s", p.Name, detail),
+					})
+				}
 			}
 		}
 	}
