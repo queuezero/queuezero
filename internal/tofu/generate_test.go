@@ -262,9 +262,10 @@ func TestGenerate_Storage_FSxLustreErrors(t *testing.T) {
 // ---- shared fakeExecutor (used by command-level checks) ---------------------
 
 type fakeExecutor struct {
-	calls     []string
+	calls      []string
 	planResult PlanSummary
 	applyErr   error
+	outputs    map[string]string
 }
 
 func (f *fakeExecutor) Init(_ context.Context, _ string, _ BackendConfig) error {
@@ -278,6 +279,10 @@ func (f *fakeExecutor) Plan(_ context.Context, _ string) (PlanSummary, error) {
 func (f *fakeExecutor) Apply(_ context.Context, _ string) error {
 	f.calls = append(f.calls, "apply")
 	return f.applyErr
+}
+func (f *fakeExecutor) Output(_ context.Context, _ string) (map[string]string, error) {
+	f.calls = append(f.calls, "output")
+	return f.outputs, nil
 }
 
 func TestFakeExecutor_PlanThenOptionalApply(t *testing.T) {

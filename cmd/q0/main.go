@@ -68,7 +68,7 @@ func cmdApply() *cobra.Command {
 	var scriptsBucket, manifestBucket, stateBucket, lockTable string
 	var adminCIDR string
 	var azCount int
-	var approve, dryRun bool
+	var approve, dryRun, showEnv bool
 	c := &cobra.Command{
 		Use:   "apply <layer>",
 		Short: "apply a composable spec layer (cluster only in this phase)",
@@ -164,6 +164,18 @@ func cmdApply() *cobra.Command {
 			if err := ex.Init(cmd.Context(), workdir, backend); err != nil {
 				return err
 			}
+
+			// --show-env: read the already-applied layer's outputs and print the
+			// Q0_* env to pin, without planning or applying.
+			if showEnv {
+				out, err := ex.Output(cmd.Context(), workdir)
+				if err != nil {
+					return err
+				}
+				printApplyEnv(out)
+				return nil
+			}
+
 			plan, err := ex.Plan(cmd.Context(), workdir)
 			if err != nil {
 				return err
@@ -177,7 +189,9 @@ func cmdApply() *cobra.Command {
 				return err
 			}
 			fmt.Printf("layer=cluster hash=%s applied\n", hash)
-			fmt.Printf("pin outputs: %s / %s (see `tofu -chdir=%s output`)\n", asbx.EnvInstanceProfile, asbx.EnvScriptsBucket, workdir)
+			if out, oerr := ex.Output(cmd.Context(), workdir); oerr == nil {
+				printApplyEnv(out)
+			}
 			return nil
 		},
 	}
@@ -192,7 +206,44 @@ func cmdApply() *cobra.Command {
 	c.Flags().StringVar(&adminCIDR, "admin-cidr", "0.0.0.0/0", "source CIDR allowed to SSH the controller")
 	c.Flags().BoolVar(&approve, "approve", false, "apply the plan (default: plan only)")
 	c.Flags().BoolVar(&dryRun, "dry-run", false, "render HCL and print intent; touch no AWS or tofu")
+	c.Flags().BoolVar(&showEnv, "show-env", false, "read the applied layer's outputs and print the Q0_* env to pin")
 	return c
+}
+
+// printApplyEnv prints a ready-to-eval block of `export Q0_*=...` lines derived
+// from a layer's tofu outputs, so the operator can `eval "$(q0 apply cluster
+// --show-env)"` instead of hand-pinning each value. EFS DNS names are printed as
+// informational comments (mount wiring is a later phase).
+func printApplyEnv(out map[string]string) {
+	fmt.Println("# pin these into the resume/suspend environment:")
+	for _, line := range applyEnvLines(out) {
+		fmt.Println(line)
+	}
+}
+
+// applyEnvLines maps known tofu output names to the Q0_* env they feed and
+// returns the lines to print, in a stable order. Pure (no I/O) so it is
+// table-testable. Unknown/absent outputs are omitted; EFS DNS becomes a comment.
+func applyEnvLines(out map[string]string) []string {
+	var lines []string
+	add := func(env, key string) {
+		if v := out[key]; v != "" {
+			lines = append(lines, fmt.Sprintf("export %s=%s", env, v))
+		}
+	}
+	add(asbx.EnvInstanceProfile, "node_instance_profile_arn")
+	add(asbx.EnvScriptsBucket, "scripts_bucket")
+	add(asbx.EnvManifestBucket, "manifest_bucket")
+	add(asbx.EnvControllerHost, "controller_private_ip")
+	// EFS mounts: informational only — mount wiring is a later phase.
+	for i := 0; ; i++ {
+		dns, ok := out[fmt.Sprintf("efs_%d_dns", i)]
+		if !ok || dns == "" {
+			break
+		}
+		lines = append(lines, fmt.Sprintf("# efs_%d = %s (mount target — wiring deferred)", i, dns))
+	}
+	return lines
 }
 
 // firstNonEmpty returns the first non-empty string.

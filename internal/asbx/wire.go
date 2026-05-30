@@ -42,6 +42,7 @@ const (
 	EnvStateBucket   = "Q0_STATE_BUCKET"
 	EnvLockTable     = "Q0_LOCK_TABLE"
 	EnvInstanceProfile = "Q0_INSTANCE_PROFILE_ARN"
+	EnvControllerHost = "Q0_CONTROLLER_HOST"   // slurmctld host (controller private IP); consumed by resume/suspend (later)
 	EnvASBBEndpoint  = "Q0_ASBB_ENDPOINT"      // spend-rate admission service URL; empty = no gate
 	EnvFailMode      = "Q0_ADMISSION_FAILMODE" // graceful (default) | strict
 	EnvPartition     = "Q0_PARTITION"
@@ -70,6 +71,9 @@ type Settings struct {
 	ASBBEndpoint string
 	// FailMode governs an admission-check error: "graceful" (default) or "strict".
 	FailMode string
+	// ControllerHost is the slurmctld host (controller private IP), produced by
+	// `q0 apply` and consumed by the resume/suspend side (a later phase).
+	ControllerHost string
 	// Partition is the partition name slurmctld is resuming/suspending, if known
 	// (from --partition or the Slurm/Q0 env). Empty => resolve by node name.
 	Partition string
@@ -97,6 +101,7 @@ func SettingsFromEnv(partitionFlag string) Settings {
 		InstanceProfileArn: os.Getenv(EnvInstanceProfile),
 		ASBBEndpoint:       os.Getenv(EnvASBBEndpoint),
 		FailMode:           os.Getenv(EnvFailMode),
+		ControllerHost:     os.Getenv(EnvControllerHost),
 		Partition:          partition,
 	}
 }
