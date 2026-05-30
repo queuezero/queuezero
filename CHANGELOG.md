@@ -15,6 +15,10 @@ queuezero is pre-release (`0.0.0-dev`); no versioned release has been tagged yet
 The entries below accumulate toward the first tagged release.
 
 ### Added
+- **Reference node bootstrap script-set** (`scripts/bootstrap/`): the `bootstrap.sh` entrypoint the
+  userdata shim execs — sources `/etc/q0/mounts`, mounts EFS shared storage, configures slurmd's
+  `SlurmctldHost` (primary + standby) and starts `slurmd` + `q0-spored` — plus a `q0-spored.service`
+  systemd unit and a README documenting the contract. Packable via `q0 bootstrap push`. (#7)
 - **Controller named standby** (`q0 apply cluster`): when `controller.standbyHost` is set, a second
   identical slurmctld pet is provisioned (the Slurm backup `SlurmctldHost`) sharing the controller SG,
   subnet, and instance profile; its private IP is emitted as a tofu output and pinned to
@@ -39,5 +43,9 @@ The entries below accumulate toward the first tagged release.
 - **`q0 preflight`**: read-only EC2 offering/AMI/subnet/AZ checks plus truffle-backed Service-Quota
   checks (`--no-quota` to skip).
 - **`q0 bootstrap push`**, **`q0 explain`** (structured per-entity reconciliation traces).
+
+### Changed
+- **`q0-spored`** now discovers its AWS region from IMDS when `Q0_REGION` is unset (previously it
+  exited). A node no longer needs the region delivered to it. (#7)
 
 [Unreleased]: https://github.com/queuezero/queuezero/commits/main

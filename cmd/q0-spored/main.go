@@ -34,15 +34,18 @@ func main() {
 	once := flag.Bool("once", false, "report once and exit (for testing/debugging)")
 	flag.Parse()
 
-	region := os.Getenv("Q0_REGION")
-	if region == "" {
-		fmt.Fprintln(os.Stderr, "q0-spored: Q0_REGION is required")
-		os.Exit(1)
-	}
-
 	// SIGTERM/SIGINT -> graceful stop (systemd stop, node shutdown).
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
+
+	// Region: explicit Q0_REGION wins; otherwise discover it from IMDS so a node
+	// never needs the region delivered to it. The IMDS client used for the lookup
+	// is link-local and needs no region itself.
+	region, err := resolveRegion(ctx, os.Getenv("Q0_REGION"), imds.New(imds.Options{}))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "q0-spored:", err)
+		os.Exit(1)
+	}
 
 	awsCfg, err := awssdkconfig.LoadDefaultConfig(ctx, awssdkconfig.WithRegion(region))
 	if err != nil {
@@ -78,6 +81,7 @@ func main() {
 //     Q0_MOUNTS_FILE) — spored runs as its own systemd service and does not
 //     inherit the shim's process env, so the file is the reliable channel.
 //   - Q0_CHECK_SLURMD: "true" (default) adds the slurmd liveness probe.
+//   - Q0_REGION: optional — when unset, the region is discovered from IMDS.
 func probesFromEnv() []spored.Probe {
 	var probes []spored.Probe
 	for _, p := range strings.Split(mountPaths(), ",") {

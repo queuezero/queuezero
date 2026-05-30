@@ -1,0 +1,22 @@
+# queuezero on-node readiness reporter (ARCHITECTURE §11).
+# Reference systemd unit — adapt the binary path to your AMI's install location.
+#
+# q0-spored resolves its region from IMDS when Q0_REGION is unset, reads its
+# mount-health probe paths from /etc/q0/mounts (written by the userdata shim),
+# and writes q0:phase/q0:ready/q0:detail to its own EC2 tags. It is a sensor,
+# never an orchestrator (non-negotiable #8) — no idle-kill, no self-termination.
+[Unit]
+Description=queuezero on-node readiness reporter (q0-spored)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/q0-spored
+# Q0_REGION is optional (IMDS fallback). Uncomment to pin explicitly:
+# Environment=Q0_REGION=us-east-1
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
