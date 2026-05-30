@@ -138,6 +138,14 @@ func underMount(path, mount string) bool {
 // validate checks the network spec: a bring-your-own network must name a VPC and
 // at least one subnet; a generated network must carry a parseable CIDR.
 func (n NetworkSpec) validate(cluster string) error {
+	// The egress mode is validated regardless of BYO so a typo is caught early,
+	// even though BYO networks bring their own routing and ignore it.
+	switch n.Egress {
+	case "", EgressNATGateway, EgressNATInstance, EgressEndpointsOnly:
+	default:
+		return fmt.Errorf("spec: cluster %q network.egress %q is not one of "+
+			"nat-gateway|nat-instance|endpoints-only", cluster, n.Egress)
+	}
 	if n.BYO {
 		if n.VPCID == "" {
 			return fmt.Errorf("spec: cluster %q network.byo=true but vpcId is empty", cluster)

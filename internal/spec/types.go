@@ -13,11 +13,24 @@ type Cluster struct {
 }
 
 type NetworkSpec struct {
-	BYO        bool     `yaml:"byo"`
-	VPCID      string   `yaml:"vpcId,omitempty"`
-	SubnetIDs  []string `yaml:"subnetIds,omitempty"`
-	CIDR       string   `yaml:"cidr,omitempty"`
+	BYO       bool     `yaml:"byo"`
+	VPCID     string   `yaml:"vpcId,omitempty"`
+	SubnetIDs []string `yaml:"subnetIds,omitempty"`
+	CIDR      string   `yaml:"cidr,omitempty"`
+	// Egress selects how a GENERATED VPC's private subnets reach the internet:
+	// nat-gateway (managed NAT, default), nat-instance (a cheap t4g.nano NAT
+	// instance), or endpoints-only (no general egress — S3/DynamoDB gateway
+	// endpoints only, for fully-baked AMIs). Empty defaults to nat-gateway.
+	// Ignored when BYO (a brought network owns its own routing).
+	Egress string `yaml:"egress,omitempty"`
 }
+
+// Egress modes for a generated VPC (NetworkSpec.Egress).
+const (
+	EgressNATGateway    = "nat-gateway"
+	EgressNATInstance   = "nat-instance"
+	EgressEndpointsOnly = "endpoints-only"
+)
 
 // ControllerSpec describes the slurmctld pair. The controller is an
 // explicitly named, stateful singleton with a named standby — NOT an ASG of

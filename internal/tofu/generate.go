@@ -51,6 +51,7 @@ type templateData struct {
 	Storage        []storageTmpl // derived storage entries (efs + fsx-lustre) the template renders
 	HasEFS         bool          // any efs entry => render the NFS security group
 	HasLustre      bool          // any fsx-lustre entry => render the Lustre security group
+	EgressMode     string        // resolved generated-VPC egress mode (never empty for a generated network)
 }
 
 // FSx-Lustre defaults applied by the generator when the spec leaves them unset.
@@ -114,6 +115,16 @@ func buildStorage(c *spec.Cluster) (out []storageTmpl, hasEFS, hasLustre bool, e
 	return out, hasEFS, hasLustre, nil
 }
 
+// resolveEgressMode defaults an empty generated-VPC egress mode to nat-gateway
+// (today's behavior). Validation of the value happens in spec; here we only
+// fill the default so the template always has a concrete mode to branch on.
+func resolveEgressMode(mode string) string {
+	if mode == "" {
+		return spec.EgressNATGateway
+	}
+	return mode
+}
+
 // GenerateClusterFoundation renders the .tf files for the foundation layer and
 // returns them as filename->content (also written to dir). It does NOT run tofu;
 // the caller applies them via an Executor. The generated HCL is deterministic so
@@ -151,6 +162,7 @@ func GenerateClusterFoundation(c *spec.Cluster, opts FoundationOpts) (map[string
 		Storage:        storage,
 		HasEFS:         hasEFS,
 		HasLustre:      hasLustre,
+		EgressMode:     resolveEgressMode(c.Network.Egress),
 	}
 
 	files := map[string]string{}
@@ -319,10 +331,13 @@ resource "aws_subnet" "public" {
   tags = { Name = "{{.Name}}-public-${count.index}", "q0:cluster" = "{{.Name}}" }
 }
 
-# TODO(cost): a managed NAT gateway is expensive (~$32/mo + $/GB, per-AZ). Revisit:
-# S3/DynamoDB VPC gateway endpoints (free, covers bootstrap fetch), a single shared
-# NAT, a NAT instance (fck-nat), or public subnets. Make it a cluster.yaml knob.
-# See memory: nat-gateway-cost-revisit.
+# Private-subnet egress mode (cluster.yaml network.egress; issue #10):
+#   nat-gateway     — managed NAT gateway (default; priciest, ~$32/mo + $/GB)
+#   nat-instance    — a t4g.nano NAT instance (~$3/mo)
+#   endpoints-only  — no general egress; S3/DynamoDB gateway endpoints only
+# S3 + DynamoDB gateway endpoints are added in ALL modes (free; keep bootstrap
+# fetch + tofu-state off the priced path).
+{{- if eq .EgressMode "nat-gateway"}}
 resource "aws_eip" "nat" {
   domain = "vpc"
   tags   = { Name = "{{.Name}}-nat", "q0:cluster" = "{{.Name}}" }
@@ -334,6 +349,50 @@ resource "aws_nat_gateway" "this" {
   tags          = { Name = "{{.Name}}-nat", "q0:cluster" = "{{.Name}}" }
   depends_on    = [aws_internet_gateway.this]
 }
+{{- else if eq .EgressMode "nat-instance"}}
+# A cheap NAT instance (t4g.nano) instead of the managed gateway. Amazon Linux
+# 2023 via the public SSM parameter (deterministic — no AMI id baked into HCL).
+data "aws_ssm_parameter" "nat_ami" {
+  name = "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64"
+}
+
+resource "aws_security_group" "nat" {
+  name        = "{{.Name}}-nat"
+  description = "queuezero NAT instance: egress all, ingress from the VPC CIDR"
+  vpc_id      = aws_vpc.this.id
+  ingress {
+    description = "all from VPC"
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["{{.Cluster.Network.CIDR}}"]
+  }
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+  tags = { Name = "{{.Name}}-nat", "q0:cluster" = "{{.Name}}" }
+}
+
+resource "aws_instance" "nat" {
+  ami                         = data.aws_ssm_parameter.nat_ami.value
+  instance_type               = "t4g.nano"
+  subnet_id                   = aws_subnet.public[0].id
+  vpc_security_group_ids      = [aws_security_group.nat.id]
+  associate_public_ip_address = true
+  source_dest_check           = false
+  user_data = <<-NATEOF
+    #!/bin/bash
+    set -euo pipefail
+    sysctl -w net.ipv4.ip_forward=1
+    iface=$(ip route show default | awk '{print $5; exit}')
+    iptables -t nat -A POSTROUTING -o "$iface" -j MASQUERADE
+  NATEOF
+  tags = { Name = "{{.Name}}-nat", "q0:cluster" = "{{.Name}}", "q0:role" = "nat" }
+}
+{{- end}}
 
 resource "aws_route_table" "public" {
   vpc_id = aws_vpc.this.id
@@ -344,13 +403,42 @@ resource "aws_route_table" "public" {
   tags = { Name = "{{.Name}}-public", "q0:cluster" = "{{.Name}}" }
 }
 
+# Private route table. The default (0.0.0.0/0) route is added as a separate,
+# mode-gated resource below; endpoints-only has no default route at all.
 resource "aws_route_table" "private" {
   vpc_id = aws_vpc.this.id
-  route {
-    cidr_block     = "0.0.0.0/0"
-    nat_gateway_id = aws_nat_gateway.this.id
-  }
-  tags = { Name = "{{.Name}}-private", "q0:cluster" = "{{.Name}}" }
+  tags   = { Name = "{{.Name}}-private", "q0:cluster" = "{{.Name}}" }
+}
+{{- if eq .EgressMode "nat-gateway"}}
+resource "aws_route" "private_default" {
+  route_table_id         = aws_route_table.private.id
+  destination_cidr_block = "0.0.0.0/0"
+  nat_gateway_id         = aws_nat_gateway.this.id
+}
+{{- else if eq .EgressMode "nat-instance"}}
+resource "aws_route" "private_default" {
+  route_table_id         = aws_route_table.private.id
+  destination_cidr_block = "0.0.0.0/0"
+  network_interface_id   = aws_instance.nat.primary_network_interface_id
+}
+{{- end}}
+
+# S3 + DynamoDB gateway endpoints (free) — associated with the private route
+# table so bootstrap S3 fetches and tofu-state DynamoDB never traverse NAT.
+resource "aws_vpc_endpoint" "s3" {
+  vpc_id            = aws_vpc.this.id
+  service_name      = "com.amazonaws.{{.Region}}.s3"
+  vpc_endpoint_type = "Gateway"
+  route_table_ids   = [aws_route_table.private.id]
+  tags = { Name = "{{.Name}}-s3", "q0:cluster" = "{{.Name}}" }
+}
+
+resource "aws_vpc_endpoint" "dynamodb" {
+  vpc_id            = aws_vpc.this.id
+  service_name      = "com.amazonaws.{{.Region}}.dynamodb"
+  vpc_endpoint_type = "Gateway"
+  route_table_ids   = [aws_route_table.private.id]
+  tags = { Name = "{{.Name}}-dynamodb", "q0:cluster" = "{{.Name}}" }
 }
 
 resource "aws_route_table_association" "public" {
