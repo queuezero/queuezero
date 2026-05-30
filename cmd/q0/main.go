@@ -242,6 +242,7 @@ func applyEnvLines(cl *spec.Cluster, out map[string]string) []string {
 	add(asbx.EnvScriptsBucket, "scripts_bucket")
 	add(asbx.EnvManifestBucket, "manifest_bucket")
 	add(asbx.EnvControllerHost, "controller_private_ip")
+	add(asbx.EnvControllerStandbyHost, "controller_standby_private_ip")
 
 	// Q0_MOUNT_SPEC: zip cluster.yaml Storage (mount path, by list index) with the
 	// tofu efs_<i>_dns outputs (2i indexes efs entries by their Storage position).
