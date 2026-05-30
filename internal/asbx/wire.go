@@ -44,6 +44,7 @@ const (
 	EnvLockTable     = "Q0_LOCK_TABLE"
 	EnvInstanceProfile = "Q0_INSTANCE_PROFILE_ARN"
 	EnvControllerHost = "Q0_CONTROLLER_HOST"   // slurmctld host (controller private IP); delivered to launched nodes via the bootstrap shim
+	EnvControllerStandbyHost = "Q0_CONTROLLER_STANDBY_HOST" // standby slurmctld host (backup SlurmctldHost); node-side wiring via bootstrap.sh (issue #7)
 	EnvMountSpec     = "Q0_MOUNT_SPEC"         // shared-storage spec "dns:path,..." delivered to launched nodes
 	EnvASBBEndpoint  = "Q0_ASBB_ENDPOINT"      // spend-rate admission service URL; empty = no gate
 	EnvFailMode      = "Q0_ADMISSION_FAILMODE" // graceful (default) | strict
@@ -74,8 +75,12 @@ type Settings struct {
 	// FailMode governs an admission-check error: "graceful" (default) or "strict".
 	FailMode string
 	// ControllerHost is the slurmctld host (controller private IP), produced by
-	// `q0 apply` and consumed by the resume/suspend side (a later phase).
+	// `q0 apply` and delivered to launched nodes via the bootstrap shim.
 	ControllerHost string
+	// ControllerStandbyHost is the standby slurmctld's private IP (the backup
+	// SlurmctldHost), produced by `q0 apply` when a standby is declared. Node-side
+	// slurm.conf wiring is the operator bootstrap.sh's job (issue #7).
+	ControllerStandbyHost string
 	// MountSpec is the shared-storage spec ("dns:path,...") produced by `q0 apply`
 	// and delivered to launched nodes via the bootstrap shim. Empty => no mounts.
 	MountSpec string
@@ -106,8 +111,9 @@ func SettingsFromEnv(partitionFlag string) Settings {
 		InstanceProfileArn: os.Getenv(EnvInstanceProfile),
 		ASBBEndpoint:       os.Getenv(EnvASBBEndpoint),
 		FailMode:           os.Getenv(EnvFailMode),
-		ControllerHost:     os.Getenv(EnvControllerHost),
-		MountSpec:          os.Getenv(EnvMountSpec),
+		ControllerHost:        os.Getenv(EnvControllerHost),
+		ControllerStandbyHost: os.Getenv(EnvControllerStandbyHost),
+		MountSpec:             os.Getenv(EnvMountSpec),
 		Partition:          partition,
 	}
 }

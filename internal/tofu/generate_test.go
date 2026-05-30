@@ -186,16 +186,51 @@ func TestGenerate_ControllerPresent(t *testing.T) {
 			t.Errorf("controller.tf missing %q", w)
 		}
 	}
-	// Exactly one controller instance (a pet, not a count).
+	// Exactly one PRIMARY controller instance (a pet, not a count). The needle ends
+	// in the closing quote after "controller", so it does not match the distinct
+	// "controller_standby" resource.
 	if n := strings.Count(ctl, `resource "aws_instance" "controller"`); n != 1 {
-		t.Errorf("want exactly 1 controller instance, got %d", n)
+		t.Errorf("want exactly 1 primary controller instance, got %d", n)
 	}
 	if strings.Contains(ctl, "count =") {
 		t.Error("controller must not use count (it is a named pet, not an ASG)")
 	}
+	// The fixture sets StandbyHost=gauss-ctl-2 => a second named standby pet.
+	for _, w := range []string{
+		`resource "aws_instance" "controller_standby"`,
+		`Name          = "gauss-ctl-2"`,
+		`"q0:role"     = "controller-standby"`,
+	} {
+		if !strings.Contains(ctl, w) {
+			t.Errorf("controller.tf missing standby %q", w)
+		}
+	}
 	out := files["outputs.tf"]
 	if !strings.Contains(out, "controller_private_ip") {
 		t.Error("outputs.tf should export controller_private_ip when a controller is present")
+	}
+	if !strings.Contains(out, "controller_standby_private_ip") {
+		t.Error("outputs.tf should export controller_standby_private_ip when a standby is declared")
+	}
+}
+
+// A controller WITHOUT a StandbyHost renders no standby resource or output.
+func TestGenerate_ControllerNoStandby(t *testing.T) {
+	c := generatedWithController()
+	c.Controller.StandbyHost = ""
+	files, err := GenerateClusterFoundation(c, FoundationOpts{ScriptsBucket: "b"})
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	if strings.Contains(files["controller.tf"], "controller_standby") {
+		t.Error("no StandbyHost => no standby instance")
+	}
+	if strings.Contains(files["outputs.tf"], "controller_standby_private_ip") {
+		t.Error("no StandbyHost => no standby output")
+	}
+	// The primary controller is still there.
+	if !strings.Contains(files["controller.tf"], `resource "aws_instance" "controller"`) {
+		t.Error("primary controller should still render without a standby")
 	}
 }
 

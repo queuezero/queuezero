@@ -15,6 +15,11 @@ queuezero is pre-release (`0.0.0-dev`); no versioned release has been tagged yet
 The entries below accumulate toward the first tagged release.
 
 ### Added
+- **Controller named standby** (`q0 apply cluster`): when `controller.standbyHost` is set, a second
+  identical slurmctld pet is provisioned (the Slurm backup `SlurmctldHost`) sharing the controller SG,
+  subnet, and instance profile; its private IP is emitted as a tofu output and pinned to
+  `Q0_CONTROLLER_STANDBY_HOST`. Failover is Slurm's runtime behavior over the shared state dir — never
+  an ASG (§9). (#6)
 - **cohort reconciler core** (`internal/cohort`): provider-/scheduler-/domain-agnostic
   reconciliation of named entity cohorts with all-or-nothing collective gating, fast-fail,
   and a populated `Record` per entity. Tested entirely against fakes.

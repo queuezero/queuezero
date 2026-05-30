@@ -465,8 +465,10 @@ resource "aws_iam_instance_profile" "controller" {
 }
 
 # The slurmctld controller: a named, AMI-pinned, stateful singleton — a pet, not
-# an ASG of one (ARCHITECTURE §9). StandbyHost {{if .Cluster.Controller.StandbyHost}}({{.Cluster.Controller.StandbyHost}}) {{end}}is recorded but the
-# second instance + failover wiring is a later sub-phase.
+# an ASG of one (ARCHITECTURE §9). When a StandbyHost is declared, a second
+# identical pet is provisioned below as the Slurm backup SlurmctldHost; both
+# share the durable StateDir, so failover is Slurm's runtime behavior (the
+# backup takes over the same StateSaveLocation) — never an ASG.
 resource "aws_instance" "controller" {
   ami                    = "{{.Cluster.Controller.AMIHash}}"
   instance_type          = "{{.Cluster.Controller.InstanceType}}"
@@ -482,6 +484,26 @@ resource "aws_instance" "controller" {
     {{- end}}
   }
 }
+{{- if .Cluster.Controller.StandbyHost}}
+
+# The named standby slurmctld (Slurm backup SlurmctldHost): an identical pet
+# sharing the controller SG, subnet, and instance profile. It runs slurmctld
+# against the same shared StateDir; Slurm promotes it when the primary is
+# unreachable. A separate named resource, NOT a count — the controller pair is
+# two pets, never an ASG (§9).
+resource "aws_instance" "controller_standby" {
+  ami                    = "{{.Cluster.Controller.AMIHash}}"
+  instance_type          = "{{.Cluster.Controller.InstanceType}}"
+  subnet_id              = local.subnet_ids[0]
+  vpc_security_group_ids = [aws_security_group.controller.id]
+  iam_instance_profile   = aws_iam_instance_profile.controller.name
+  tags = {
+    Name          = "{{.Cluster.Controller.StandbyHost}}"
+    "q0:cluster"  = "{{.Name}}"
+    "q0:role"     = "controller-standby"
+  }
+}
+{{- end}}
 {{- else}}
 # No controller requested in cluster.yaml (network-only bring-up).
 {{- end}}
@@ -662,6 +684,17 @@ output "controller_instance_id" {
   value       = aws_instance.controller.id
   description = "The slurmctld controller instance id."
 }
+{{if .Cluster.Controller.StandbyHost}}
+output "controller_standby_private_ip" {
+  value       = aws_instance.controller_standby.private_ip
+  description = "The standby slurmctld's private IP (the backup SlurmctldHost)."
+}
+
+output "controller_standby_instance_id" {
+  value       = aws_instance.controller_standby.id
+  description = "The standby slurmctld instance id."
+}
+{{end}}
 {{end}}
 {{range .Storage}}
 {{- if eq .Kind "efs"}}

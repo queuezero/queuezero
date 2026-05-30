@@ -17,9 +17,10 @@ func TestApplyEnvLines(t *testing.T) {
 	out := map[string]string{
 		"node_instance_profile_arn": "arn:aws:iam::111122223333:instance-profile/q0-node",
 		"scripts_bucket":            "gauss-q0-scripts",
-		"controller_private_ip":     "10.0.1.42",
-		"efs_0_dns":                 "fs-abc.efs.us-east-1.amazonaws.com",
-		"vpc_id":                    "vpc-123", // not mapped to an env — should be omitted
+		"controller_private_ip":         "10.0.1.42",
+		"controller_standby_private_ip": "10.0.1.43",
+		"efs_0_dns":                     "fs-abc.efs.us-east-1.amazonaws.com",
+		"vpc_id":                        "vpc-123", // not mapped to an env — should be omitted
 	}
 	joined := strings.Join(applyEnvLines(cl, out), "\n")
 
@@ -27,6 +28,7 @@ func TestApplyEnvLines(t *testing.T) {
 		"export Q0_INSTANCE_PROFILE_ARN=arn:aws:iam::111122223333:instance-profile/q0-node",
 		"export Q0_SCRIPTS_BUCKET=gauss-q0-scripts",
 		"export Q0_CONTROLLER_HOST=10.0.1.42",
+		"export Q0_CONTROLLER_STANDBY_HOST=10.0.1.43",
 		"export Q0_MOUNT_SPEC=fs-abc.efs.us-east-1.amazonaws.com:/shared",
 	}
 	for _, w := range wants {
